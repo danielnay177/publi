@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "publi",
+    "slug": "publi",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/publi-icon.png",
+    "newArchEnabled": true,
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.publi.app", "buildNumber": "1" },
+    "android": { "package": "com.publi.app", "adaptiveIcon": { "foregroundImage": "./assets/publi-icon.png", "backgroundColor": "#171C1B" } },
+    "plugins": [["expo-audio", { "microphonePermission": "Publi uses your microphone to record your story ideas." }]],
+    "splash": { "backgroundColor": "#171C1B", "resizeMode": "contain" }
+  }
+}
