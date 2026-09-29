@@ -4,7 +4,7 @@ workflows:
     max_build_duration: 90
     instance_type: mac_mini_m2
     integrations:
-      app_store_connect: codemagic
+      app_store_connect: "JDPrep Codemagic"
     environment:
       ios_signing:
         distribution_type: app_store
