@@ -7,8 +7,10 @@ workflows:
       app_store_connect: "JDPrep Codemagic"
     environment:
       ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.publi.app
+        provisioning_profiles:
+          - PubliAppAttestProfile
+        certificates:
+          - UpskillCertificate
       vars:
         XCODE_WORKSPACE: ios/publi.xcworkspace
         XCODE_SCHEME: publi
