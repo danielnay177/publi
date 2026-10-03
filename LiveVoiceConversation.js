@@ -192,7 +192,9 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
       const capture = await player.startCapture();
       pauseUplinkDuringPlaybackRef.current = !!capture?.simulator || !capture?.voiceProcessing;
       setTapToInterrupt(pauseUplinkDuringPlaybackRef.current);
-      setPhase('listening');
+      // Mute may be tapped while the connection/capture is still opening.
+      if (mutedRef.current) player.stopCapture();
+      setPhase(mutedRef.current ? 'muted' : 'listening');
       timerRef.current = setTimeout(() => {
         if (activeRef.current) { disconnect(); setPhase('disconnected'); setError('This live session reached its time limit. Reconnect to continue.'); }
       }, MAX_SESSION_MS);
