@@ -13,6 +13,7 @@ import * as Speech from 'expo-speech';
 import { auth, initializeFirebaseServices } from './firebase';
 import { createUserWithEmailAndPassword, deleteUser, onAuthStateChanged, signInAnonymously, signInWithEmailAndPassword, signOut, updateProfile } from '@react-native-firebase/auth';
 import { analyzeRecording, generateStoryOutline } from './aiService';
+import { prepareAudioPlayback, replaceAudioAndWait } from './audioPlayback';
 import { subscribeDrafts, saveDraft as saveCloudDraft, deleteDraft, subscribeRecordings, subscribeVoiceStories, createVoiceStory, updateVoiceStory, deleteVoiceStory, applySuggestedVoiceStoryTitle, adoptRecordingAsVoiceStory, saveRecording, updateRecording, deleteRecording, downloadRecordingForAnalysis, saveProfile as saveCloudProfile, subscribeProfile, saveBookmarks, subscribeBookmarks, migrateLocalData, deleteCloudAccountData } from './cloudData';
 import DraftVoiceExperience, { TopicIdeas } from './DraftVoiceExperience';
 import DraftHomePrototype from './DraftHomePrototype';
@@ -623,7 +624,8 @@ export default function App() {
       const result = await analyzeRecording({
         uri: pending.uri, mimeType: saved.contentType, title: story.title,
         priorContext: [story.openingText, pending.context].filter(Boolean).join('\n\n'),
-        selectedQuestion: pending.question,
+        selectedQuestion: pending.question, onProgress: setProcessingStage,
+        onTranscript: transcript => updateRecording(firebaseUser.uid, saved.id, { transcript }),
       });
       await updateRecording(firebaseUser.uid, saved.id, {
         recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '),
@@ -694,7 +696,8 @@ export default function App() {
       const result = await analyzeRecording({
         uri: localAudio.uri, mimeType: localAudio.mimeType,
         title: story?.title || '', priorContext: [story?.openingText, prior].filter(Boolean).join('\n\n'),
-        selectedQuestion: recording.prompt || '',
+        selectedQuestion: recording.prompt || '', onProgress: setProcessingStage,
+        onTranscript: transcript => updateRecording(firebaseUser.uid, recording.id, { transcript }),
       });
       await updateRecording(firebaseUser.uid, recording.id, {
         recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '),
@@ -742,6 +745,7 @@ export default function App() {
     let nextFile;
     try {
       if (loadingRecordingId) return;
+      await prepareAudioPlayback();
       if (playingRecordingId === recording.id) {
         if (playerStatus.playing) player.pause();
         else {
@@ -753,8 +757,7 @@ export default function App() {
       setLoadingRecordingId(recording.id);
       await Speech.stop(); setSpeakingQuestion(false);
       nextFile = await downloadRecordingForAnalysis(firebaseUser.uid, recording.storagePath);
-      player.pause();
-      player.replace({ uri: nextFile.uri });
+      await replaceAudioAndWait(player, nextFile.uri);
       playbackFileRef.current?.cleanup();
       playbackFileRef.current = nextFile;
       player.play();

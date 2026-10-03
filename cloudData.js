@@ -56,6 +56,18 @@ export async function createAskThread(uid, id, prompt) {
 
 export async function deleteAskThread(uid, id) {
   validUid(uid); validId(id);
+  // Firestore does not cascade subcollections when their parent is deleted.
+  const turns = await getDocs(askTurnsCollection(uid, id));
+  for (const turn of turns.docs) {
+    const value = turn.data();
+    for (const [path, remove] of [[value.audioPath, deleteAskAudio], [value.imagePath, deleteAskImage]]) {
+      if (path) {
+        try { await remove(uid, path); }
+        catch (error) { if (error?.code !== 'storage/object-not-found') throw error; }
+      }
+    }
+    await deleteDoc(turn.ref);
+  }
   await deleteDoc(doc(db(), 'users', uid, 'askThreads', id));
 }
 
@@ -104,8 +116,13 @@ export async function downloadAskAudio(uid, audioPath) {
     throw new Error('Invalid voice message path.');
   }
   const file = new File(Paths.cache, `publi-ask-${Date.now()}-${doc(askThreadsCollection(uid)).id}.m4a`);
-  await writeToFile(ref(bucket(), audioPath), file.uri);
-  return file.uri;
+  try {
+    const object = ref(bucket(), audioPath);
+    const metadata = await getMetadata(object);
+    await writeToFile(object, file.uri);
+    if (!file.exists || !file.size || file.size !== metadata.size) throw new Error('The saved audio download was incomplete. Please retry.');
+    return file.uri;
+  } catch (error) { if (file.exists) file.delete(); throw error; }
 }
 
 export async function uploadAskImage(uid, threadId, turnId, uri, mimeType = 'image/jpeg') {
@@ -369,7 +386,7 @@ export async function downloadRecordingForAnalysis(uid, storagePath) {
   const cleanup = () => { if (file.exists) file.delete(); };
   try {
     await writeToFile(object, file.uri);
-    if (!file.exists || !file.size || file.size > MAX_ANALYSIS_AUDIO_BYTES) {
+    if (!file.exists || !file.size || file.size !== metadata.size || file.size > MAX_ANALYSIS_AUDIO_BYTES) {
       throw new Error('The saved recording could not be downloaded for transcription.');
     }
     return { uri: file.uri, mimeType: mimeTypes[extension], cleanup };

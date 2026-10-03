@@ -37,6 +37,7 @@ RCT_EXPORT_MODULE();
   NSError *voiceError = nil;
   if (![self.engine.inputNode setVoiceProcessingEnabled:YES error:&voiceError])
     NSLog(@"LivePCMPlayer voice processing unavailable: %@", voiceError);
+  if (self.engine.inputNode.isVoiceProcessingEnabled) self.engine.inputNode.voiceProcessingInputMuted = NO;
   self.player = [AVAudioPlayerNode new];
   self.format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
                                                 sampleRate:24000 channels:1 interleaved:NO];
@@ -57,6 +58,10 @@ RCT_EXPORT_METHOD(startCapture:(RCTPromiseResolveBlock)resolve rejecter:(RCTProm
   if (!self.captureActive) {
     AVAudioInputNode *input = self.engine.inputNode;
     AVAudioFormat *sourceFormat = [input outputFormatForBus:0];
+    if (!sourceFormat.channelCount || sourceFormat.sampleRate <= 0) {
+      reject(@"microphone_route", @"The microphone audio route is unavailable. Disconnect Bluetooth and reconnect.", nil);
+      return;
+    }
     AVAudioFrameCount bufferSize = (AVAudioFrameCount)MAX(1024, sourceFormat.sampleRate / 10);
     __weak typeof(self) weakSelf = self;
     [input installTapOnBus:0 bufferSize:bufferSize format:sourceFormat
@@ -153,5 +158,62 @@ RCT_EXPORT_METHOD(shutdown) {
   self.player = nil;
   self.engine = nil;
   [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+}
+
+RCT_EXPORT_METHOD(preparePlaybackSession:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  NSError *error = nil;
+  AVAudioSession *session = AVAudioSession.sharedInstance;
+  if (![session setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&error] ||
+      ![session setActive:YES error:&error]) {
+    reject(@"playback_session", @"Could not activate audio playback.", error);
+    return;
+  }
+  resolve(@YES);
+}
+
+// Export bounded, overlapping clips from the original. Each transcription
+// request sees the whole clip; the original saved audio is never rewritten.
+RCT_EXPORT_METHOD(exportAudioSegments:(NSString *)uri resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:uri] options:nil];
+  double duration = CMTimeGetSeconds(asset.duration);
+  if (!isfinite(duration) || duration <= 0 || ![asset tracksWithMediaType:AVMediaTypeAudio].count) {
+    reject(@"invalid_audio", @"This recording has no readable audio track.", nil);
+    return;
+  }
+  if (duration <= 90) {
+    resolve(@[@{ @"uri": uri, @"temporary": @NO, @"duration": @(duration) }]);
+    return;
+  }
+  NSMutableArray *clips = [NSMutableArray new];
+  __block double start = 0;
+  __block void (^exportNext)(void);
+  exportNext = ^{
+    double length = MIN(90, duration - start);
+    NSURL *output = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
+      [NSString stringWithFormat:@"publi-transcribe-%@.m4a", NSUUID.UUID.UUIDString]]];
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    exporter.outputURL = output;
+    exporter.outputFileType = AVFileTypeAppleM4A;
+    exporter.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(start, 600), CMTimeMakeWithSeconds(length, 600));
+    if (!exporter) {
+      for (NSDictionary *clip in clips) [NSFileManager.defaultManager removeItemAtURL:[NSURL URLWithString:clip[@"uri"]] error:nil];
+      exportNext = nil;
+      reject(@"audio_export", @"Could not prepare the complete recording for transcription.", nil);
+      return;
+    }
+    [exporter exportAsynchronouslyWithCompletionHandler:^{ dispatch_async(dispatch_get_main_queue(), ^{
+      if (exporter.status != AVAssetExportSessionStatusCompleted) {
+        [NSFileManager.defaultManager removeItemAtURL:output error:nil];
+        for (NSDictionary *clip in clips) [NSFileManager.defaultManager removeItemAtURL:[NSURL URLWithString:clip[@"uri"]] error:nil];
+        exportNext = nil;
+        reject(@"audio_export", @"Could not prepare the complete recording for transcription.", exporter.error);
+        return;
+      }
+      [clips addObject:@{ @"uri": output.absoluteString, @"temporary": @YES, @"duration": @(length) }];
+      if (start + length >= duration) { exportNext = nil; resolve(clips); }
+      else { start += 88; exportNext(); }
+    }); }];
+  };
+  exportNext();
 }
 @end

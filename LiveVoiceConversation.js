@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Animated, Easing, NativeEventEmitter, NativeModules, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { AudioModule } from 'expo-audio';
+import { AudioModule, setAudioModeAsync } from 'expo-audio';
 import { toByteArray } from 'base64-js';
 import { getLiveGenerativeModel, ResponseModality } from '@react-native-firebase/ai';
 import { initializeFirebaseServices } from './firebase';
@@ -30,6 +30,9 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
   const threadRef = useRef(threadId);
   const savingRef = useRef(Promise.resolve());
   const timerRef = useRef(null);
+  const micWatchdogRef = useRef(null);
+  const micBuffersRef = useRef(0);
+  const connectionGenerationRef = useRef(0);
   const listenerRef = useRef(null);
   const pauseUplinkDuringPlaybackRef = useRef(false);
   const playbackTimerRef = useRef(null);
@@ -46,6 +49,7 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
     // Without reliable acoustic echo cancellation, speaker audio can look like
     // a new user turn and interrupt Publi. The orb remains tappable to barge in.
     if (speakingRef.current && pauseUplinkDuringPlaybackRef.current) return;
+    micBuffersRef.current += 1;
     const bytes = toByteArray(data);
     let energy = 0;
     for (let i = 0; i + 1 < bytes.length; i += 16) {
@@ -90,7 +94,7 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
 
   const handleServer = async (session) => {
     for await (const event of session.receive()) {
-      if (!activeRef.current) break;
+      if (!activeRef.current || sessionRef.current !== session) break;
       if (event.type === 'goAway') {
         setError('Live session is ending. Reconnect to keep talking.');
         break;
@@ -148,11 +152,13 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
         }, remainingMs + 200);
       }
     }
-    if (activeRef.current) { disconnect(); setPhase('disconnected'); setError((current) => current || 'Connection ended. Tap Reconnect to continue.'); }
+    if (activeRef.current && sessionRef.current === session) { disconnect(); setPhase('disconnected'); setError((current) => current || 'Connection ended. Tap Reconnect to continue.'); }
   };
 
   const disconnect = () => {
     activeRef.current = false;
+    connectionGenerationRef.current += 1;
+    clearTimeout(micWatchdogRef.current);
     clearTimeout(timerRef.current);
     clearTimeout(playbackTimerRef.current);
     playbackUntilRef.current = 0;
@@ -173,11 +179,15 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
     setError(''); setPhase('connecting');
     if (!player) { setPhase('disconnected'); setError('Live audio playback is unavailable in this build.'); return; }
     activeRef.current = true;
+    const generation = connectionGenerationRef.current;
+    const isCurrent = () => activeRef.current && generation === connectionGenerationRef.current;
+    micBuffersRef.current = 0;
     try {
       const permission = await AudioModule.requestRecordingPermissionsAsync();
       if (!permission.granted) throw new Error('Please allow Publi to use the microphone in Settings.');
+      await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true, shouldRouteThroughEarpiece: false, interruptionMode: 'doNotMix' });
       const { ai } = await initializeFirebaseServices();
-      if (!activeRef.current) return;
+      if (!isCurrent()) return;
       const recent = (history || []).filter((turn) => turn.status === 'ready').slice(-6)
         .map((turn) => `User: ${turn.prompt}\nPubli: ${turn.answer}`).join('\n');
       const model = getLiveGenerativeModel(ai, {
@@ -186,22 +196,33 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
         systemInstruction: `You are Publi, a thoughtful voice companion. Converse naturally and briefly. Ask useful follow-up questions that help the user develop their own ideas. Let the user interrupt you. Do not speak markdown formatting.${recent ? `\nRecent chat context:\n${recent}` : ''}`,
       });
       const session = await model.connect();
-      if (!activeRef.current) { await session.close(); return; }
+      if (!isCurrent()) { await session.close(); return; }
       sessionRef.current = session;
       listenerRef.current = new NativeEventEmitter(player).addListener('LiveMicPCM', handleMicBuffer);
       const capture = await player.startCapture();
+      if (!isCurrent()) return;
       pauseUplinkDuringPlaybackRef.current = !!capture?.simulator || !capture?.voiceProcessing;
       setTapToInterrupt(pauseUplinkDuringPlaybackRef.current);
       // Mute may be tapped while the connection/capture is still opening.
       if (mutedRef.current) player.stopCapture();
       setPhase(mutedRef.current ? 'muted' : 'listening');
+      micWatchdogRef.current = setTimeout(() => {
+        if (isCurrent() && !mutedRef.current && !micBuffersRef.current) {
+          disconnect(); setPhase('disconnected');
+          setError('No microphone audio reached the conversation. Check microphone access and reconnect.');
+        }
+      }, 8000);
       timerRef.current = setTimeout(() => {
         if (activeRef.current) { disconnect(); setPhase('disconnected'); setError('This live session reached its time limit. Reconnect to continue.'); }
       }, MAX_SESSION_MS);
       handleServer(session).catch((receiveError) => {
-        if (activeRef.current) { disconnect(); setPhase('disconnected'); setError(receiveError?.message || 'Live connection failed.'); }
+        if (isCurrent() && sessionRef.current === session) { disconnect(); setPhase('disconnected'); setError(receiveError?.message || 'Live connection failed.'); }
       });
+      // An audible greeting confirms that the response channel is working
+      // before the person starts talking into a seemingly silent session.
+      await session.send('Briefly say hello and invite me to share what is on my mind.');
     } catch (connectError) {
+      if (!isCurrent()) return;
       disconnect(); setPhase('disconnected'); setError(connectError?.message || 'Could not connect to Gemini Live.');
     }
   };
@@ -218,7 +239,10 @@ export default function LiveVoiceConversation({ uid, threadId, history, onThread
     const next = !mutedRef.current;
     mutedRef.current = next; setMuted(next);
     if (next) { player?.stopCapture(); setPhase('muted'); }
-    else if (sessionRef.current) { await player.startCapture(); setPhase(speakingRef.current ? 'speaking' : 'listening'); }
+    else if (sessionRef.current) {
+      try { await player.startCapture(); setPhase(speakingRef.current ? 'speaking' : 'listening'); }
+      catch (captureError) { disconnect(); setPhase('disconnected'); setError(captureError?.message || 'Could not resume microphone.'); }
+    }
   };
   const interruptPlayback = () => {
     if (!speakingRef.current) return;

@@ -11,6 +11,8 @@ import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioPlayer, useAu
 import * as Speech from 'expo-speech';
 import { askPubli } from './aiService';
 import LiveVoiceConversation from './LiveVoiceConversation';
+import HistoryDeleteMenu from './HistoryDeleteMenu';
+import { prepareAudioPlayback, replaceAudioAndWait } from './audioPlayback';
 import {
   createAskThread, createAskTurn, deleteAskImage, deleteAskAudio, deleteAskThread,
   downloadAskAudio, downloadAskImage, newAskThreadId, newAskTurnId,
@@ -58,8 +60,10 @@ const pickerHtml = (source) => `<!doctype html><html><head><meta name="viewport"
  img.onerror=function(){window.ReactNativeWebView.postMessage(JSON.stringify({type:'error',message:'This photo could not be opened.'}));};img.src=url;
 });</script></body></html>`;
 
-export default function AskAnythingScreen({ visible, onClose, attempts = [], onOpenAttempt, uid }) {
+export default function AskAnythingScreen({ visible, onClose, attempts = [], onOpenAttempt, onDeleteAttempt, uid }) {
   const [page, setPage] = useState('compose');
+  const [deleteItem, setDeleteItem] = useState(null);
+  const [deletingHistory, setDeletingHistory] = useState(false);
   const [threadId, setThreadId] = useState(null);
   const [threads, setThreads] = useState([]);
   const [turns, setTurns] = useState([]);
@@ -121,6 +125,7 @@ export default function AskAnythingScreen({ visible, onClose, attempts = [], onO
     setSpeakingTurnId(turnId);
     setSpeechPaused(false);
     try {
+      await prepareAudioPlayback();
       Speech.speak(answerForSpeech(answer), {
         rate: .95,
         onDone: () => {
@@ -284,8 +289,25 @@ export default function AskAnythingScreen({ visible, onClose, attempts = [], onO
     try {
       const uri = audioUris[turn.id] || await downloadAskAudio(uid, turn.audioPath);
       setAudioUris((old) => ({ ...old, [turn.id]: uri }));
-      player.replace({ uri }); player.play();
+      await stopAnswer();
+      await prepareAudioPlayback();
+      await replaceAudioAndWait(player, uri);
+      player.play();
     } catch (error) { Alert.alert('Could not play voice message', error?.message || 'Please try again.'); }
+  };
+
+  const deleteHistory = async () => {
+    if (!deleteItem || deletingHistory || sending) return;
+    setDeletingHistory(true);
+    try {
+      if (deleteItem.kind === 'chat') {
+        player.pause(); await stopAnswer();
+        await deleteAskThread(uid, deleteItem.id);
+        if (threadId === deleteItem.id) { setThreadId(null); setTurns([]); }
+      } else await onDeleteAttempt?.(deleteItem);
+      setDeleteItem(null);
+    } catch (error) { Alert.alert('Could not delete history', error?.message || 'Please try again.'); }
+    finally { setDeletingHistory(false); }
   };
 
   return <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={pickerSource ? () => setPickerSource(null) : back}>
@@ -309,12 +331,12 @@ export default function AskAnythingScreen({ visible, onClose, attempts = [], onO
           {matches.length === 0 && <Text style={s.emptyResults}>{historyItems.length ? 'No attempts match your search.' : 'Your chats and recordings will appear here.'}</Text>}
           {[...new Set(matches.map((item) => new Date(item.createdAtMs || Date.now()).toDateString()))].map((dayKey) => <View key={dayKey} style={s.group}>
             <Text style={s.groupTitle}>{dateGroup(matches.find((item) => new Date(item.createdAtMs || Date.now()).toDateString() === dayKey)?.createdAtMs)}</Text>
-            {matches.filter((item) => new Date(item.createdAtMs || Date.now()).toDateString() === dayKey).map((item) => <Pressable key={`${item.kind}-${item.id}`} accessibilityRole="button" accessibilityLabel={`Open ${item.kind === 'chat' ? 'chat' : 'attempt'} ${item.title}`} onPress={() => {
+            {matches.filter((item) => new Date(item.createdAtMs || Date.now()).toDateString() === dayKey).map((item) => <Pressable key={`${item.kind}-${item.id}`} accessibilityRole="button" accessibilityLabel={`Open ${item.kind === 'chat' ? 'chat' : 'attempt'} ${item.title}`} onLongPress={() => setDeleteItem(item)} delayLongPress={350} onPress={() => {
               if (item.kind === 'chat') { setThreadId(item.id); setPage('compose'); }
               else { setPage('compose'); onOpenAttempt?.(item); }
             }} style={s.historyCard}>
               <View style={s.historyIcon}><Ionicons name={item.kind === 'chat' ? 'chatbubble-ellipses-outline' : 'mic-outline'} size={21} color={C.green} /></View>
-              <View style={s.historyCopy}><Text numberOfLines={1} style={s.historyItemTitle}>{item.title}</Text><Text numberOfLines={1} style={s.historyMeta}>{item.time} · {item.kind === 'chat' ? 'Chat' : item.duration}</Text></View><Ionicons name="chevron-forward" size={18} color={C.muted} />
+              <View style={s.historyCopy}><Text numberOfLines={1} style={s.historyItemTitle}>{item.title}</Text><Text numberOfLines={1} style={s.historyMeta}>{item.time} · {item.kind === 'chat' ? 'Chat' : item.duration}</Text></View><Pressable accessibilityRole="button" accessibilityLabel={`Show actions for ${item.title}`} onPress={(event) => { event.stopPropagation(); setDeleteItem(item); }} hitSlop={10}><Ionicons name="ellipsis-horizontal" size={21} color={C.muted} /></Pressable>
             </Pressable>)}
           </View>)}
         </ScrollView> : page === 'voice' ? <LiveVoiceConversation uid={uid} threadId={threadId} history={turns} onThreadCreated={setThreadId} onClose={back} /> : <>
@@ -351,13 +373,14 @@ export default function AskAnythingScreen({ visible, onClose, attempts = [], onO
                 <Pressable accessibilityRole="button" accessibilityLabel={attachmentMenuOpen ? 'Close attachment menu' : 'Add an attachment'} onPress={() => { Keyboard.dismiss(); setAttachmentMenuOpen((open) => !open); }} style={s.toolButton}><Ionicons name={attachmentMenuOpen ? 'close' : 'add'} size={30} color={C.ink} /></Pressable>
                 <View style={{ flex: 1 }} /><Pressable accessibilityRole="button" accessibilityLabel="Record a voice question" onPress={() => startRecording('dictation')} disabled={sending} style={s.toolButton}><Ionicons name="mic-outline" size={24} color={C.ink} /></Pressable>
                 {message.trim() || selectedImage ? <Pressable accessibilityRole="button" accessibilityLabel="Send question" onPress={() => send()} disabled={sending} style={s.sendButton}><Ionicons name={sending ? 'hourglass-outline' : 'arrow-up'} size={24} color="#fff" /></Pressable> :
-                  <Pressable accessibilityRole="button" accessibilityLabel="Start live voice conversation" onPress={() => { stopAnswer(); Keyboard.dismiss(); setPage('voice'); }} disabled={sending} style={s.sendButton}><Ionicons name="pulse" size={25} color="#fff" /></Pressable>}
+                  <Pressable accessibilityRole="button" accessibilityLabel="Start live voice conversation" onPress={async () => { await stopAnswer(); player.pause(); Keyboard.dismiss(); setPage('voice'); }} disabled={sending} style={s.sendButton}><Ionicons name="pulse" size={25} color="#fff" /></Pressable>}
               </View>
             </View>
           </View>}
         </>}
         </>}
       </KeyboardAvoidingView>
+      <HistoryDeleteMenu item={deleteItem} busy={deletingHistory || sending} onClose={() => setDeleteItem(null)} onDelete={deleteHistory} />
     </SafeAreaView></SafeAreaProvider>
   </Modal>;
 }

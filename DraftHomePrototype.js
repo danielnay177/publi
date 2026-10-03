@@ -6,6 +6,7 @@ import { File, Paths } from 'expo-file-system';
 import Clipboard from 'react-native/Libraries/Components/Clipboard/Clipboard';
 import AskAnythingScreen from './AskAnythingScreen';
 import CaptureRecordingScreen from './CaptureRecordingScreen';
+import HistoryDeleteMenu from './HistoryDeleteMenu';
 
 const color = {
   background: '#171C1B', paper: '#222927', raised: '#2A322E', line: '#39433E',
@@ -60,6 +61,8 @@ export default function DraftHomePrototype({
   onStopPlayback, onEditStoryTitle, onArchiveStory, onDeleteStory,
 }) {
   const [screen, setScreen] = useState('home');
+  const [historyDeleteItem, setHistoryDeleteItem] = useState(null);
+  const [rawTranscripts, setRawTranscripts] = useState({});
   const [selectedRecordingId, setSelectedRecordingId] = useState(null);
   const [selectedFallback, setSelectedFallback] = useState(null);
   const [search, setSearch] = useState('');
@@ -167,6 +170,12 @@ export default function DraftHomePrototype({
     else setScreen('home');
   };
 
+  const removeHistoryItem = async (item) => {
+    const story = voiceStories.find(value => value.id === item.storyId);
+    await onDeleteStory?.(story, item);
+    setSelectedFallback(null);
+    if (selectedRecordingId === item.id) setSelectedRecordingId(null);
+  };
   const openAttempt = (attempt) => { setSelectedRecordingId(attempt.id); setScreen('detail'); };
   const startCapture = async (context = null) => {
     if (starting || recordingBusy || pendingUpload || isRecording) return;
@@ -255,10 +264,10 @@ export default function DraftHomePrototype({
       {visibleAttempts.length === 0 && <Text style={styles.noResults}>{search ? 'No stories match your search.' : showArchived ? 'No archived voice stories.' : 'Your first recording will appear here after you tap Capture.'}</Text>}
       {[...new Set(visibleAttempts.map(item => item.dayKey))].map(dayKey => <View key={dayKey} style={styles.group}>
         <Text style={styles.groupTitle}>{visibleAttempts.find(item => item.dayKey === dayKey)?.group}</Text>
-        {visibleAttempts.filter(item => item.dayKey === dayKey).map(item => <Pressable key={item.id} accessibilityRole="button" accessibilityLabel={`Open attempt ${item.title}`} onPress={() => openAttempt(item)} style={styles.attemptCard}>
+        {visibleAttempts.filter(item => item.dayKey === dayKey).map(item => <Pressable key={item.id} accessibilityRole="button" accessibilityLabel={`Open attempt ${item.title}`} onLongPress={() => setHistoryDeleteItem(item)} delayLongPress={350} onPress={() => openAttempt(item)} style={styles.attemptCard}>
           <View style={styles.attemptIcon}><Ionicons name="mic-outline" size={22} color={color.green} /></View>
           <View style={styles.attemptCopy}><Text numberOfLines={1} style={styles.attemptTitle}>{voiceStories.find(story => story.id === item.storyId)?.title || item.title}</Text><Text style={styles.attemptMeta}>{item.time}  ·  {item.duration}</Text></View>
-          <Ionicons name="chevron-forward" size={18} color={color.muted} />
+          <Pressable accessibilityRole="button" accessibilityLabel={`Show actions for ${item.title}`} hitSlop={10} onPress={(event) => { event.stopPropagation(); setHistoryDeleteItem(item); }}><Ionicons name="ellipsis-horizontal" size={22} color={color.muted} /></Pressable>
         </Pressable>)}
       </View>)}
     </ScrollView>}
@@ -277,10 +286,10 @@ export default function DraftHomePrototype({
                 <Text numberOfLines={2} style={styles.recordingTitle}>{recording.title}</Text>
               </Pressable>
               {recording.prompt ? <Text style={styles.answerPrompt}>Answering: {recording.prompt}</Text> : null}
-              <Text style={styles.transcriptLabel}>POLISHED TRANSCRIPT</Text>
-              <ReadingText value={recording.polishedText || (recording.status === 'error' ? 'Audio saved. Transcription needs another try.' : 'Uploading and polishing your voice note…')} />
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={styles.transcriptLabel}>{rawTranscripts[recording.id] ? 'WHAT YOU SAID' : 'CORRECTED TRANSCRIPT'}</Text><Pressable accessibilityRole="button" accessibilityLabel={rawTranscripts[recording.id] ? 'Show corrected transcript' : 'Show full original transcript'} onPress={() => setRawTranscripts(value => ({ ...value, [recording.id]: !value[recording.id] }))}><Text style={styles.retryAnalysisText}>{rawTranscripts[recording.id] ? 'Corrected' : 'Original'}</Text></Pressable></View>
+              <ReadingText value={(rawTranscripts[recording.id] ? recording.transcript : recording.polishedText) || (recording.status === 'error' ? 'Audio saved. Transcription needs another try.' : 'Uploading and polishing your voice note…')} />
               <Text style={styles.recordingDate}>{recording.time} · {recording.duration}</Text>
-              {recording.status === 'error' && <Pressable accessibilityRole="button" onPress={() => onRetryAnalysis?.(recording)} style={styles.retryAnalysis}><Ionicons name="refresh" size={16} color={color.green} /><Text style={styles.retryAnalysisText}>Retry transcription</Text></Pressable>}
+              {<Pressable accessibilityRole="button" accessibilityLabel="Re-transcribe saved audio" onPress={() => onRetryAnalysis?.(recording)} style={styles.retryAnalysis}><Ionicons name="refresh" size={16} color={color.green} /><Text style={styles.retryAnalysisText}>Re-transcribe audio</Text></Pressable>}
             </View>
             {Array.isArray(recording.questions) && recording.questions.length > 0 && <View style={styles.followUps}>
               <View style={styles.followUpHeading}><Ionicons name="sparkles-outline" size={15} color={color.muted} /><Text style={styles.followUpLabel}>KEEP EXPLORING</Text></View>
@@ -306,7 +315,8 @@ export default function DraftHomePrototype({
       <Pressable style={styles.menuItem} disabled={actionBusy} onPress={deleteStory}><Ionicons name="trash-outline" size={20} color="#EF7770" /><Text style={[styles.menuText, { color: '#EF7770' }]}>Delete</Text></Pressable>
     </Pressable></Pressable></Modal>
     <Modal transparent visible={editOpen} animationType="fade" onRequestClose={() => setEditOpen(false)}><View style={styles.modalShade}><View style={styles.editCard}><Text style={styles.editHeading}>Edit voice story title</Text><TextInput value={editTitle} onChangeText={setEditTitle} maxLength={200} autoFocus selectTextOnFocus style={styles.editInput} placeholder="Voice story title" placeholderTextColor={color.muted} /><View style={styles.editActions}><Pressable onPress={() => setEditOpen(false)}><Text style={styles.editCancel}>Cancel</Text></Pressable><Pressable disabled={actionBusy} onPress={saveTitle} style={styles.editSave}><Text style={styles.editSaveText}>{actionBusy ? 'Saving…' : 'Save'}</Text></Pressable></View></View></View></Modal>
-    <AskAnythingScreen visible={askOpen} onClose={() => setAskOpen(false)} uid={uid} attempts={attempts} onOpenAttempt={(attempt) => { openAttempt(attempt); setAskOpen(false); }} />
+    <HistoryDeleteMenu item={historyDeleteItem} busy={actionBusy} onClose={() => setHistoryDeleteItem(null)} onDelete={() => runAction(async () => { await removeHistoryItem(historyDeleteItem); setHistoryDeleteItem(null); }, 'Could not delete history')} />
+    <AskAnythingScreen visible={askOpen} onClose={() => setAskOpen(false)} uid={uid} attempts={historyItems} onDeleteAttempt={removeHistoryItem} onOpenAttempt={(attempt) => { openAttempt(attempt); setAskOpen(false); }} />
     <CaptureRecordingScreen visible={captureOpen} isPaused={isPaused} isProcessing={finishing || recordingBusy} durationMillis={durationMillis} metering={metering} processingStage={processingStage} prompt={captureContext?.question || ''} onPause={onPauseRecording} onResume={onResumeRecording} onStop={finishCapture} onCancel={cancelCapture} />
   </View>;
 }

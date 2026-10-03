@@ -6,20 +6,23 @@ const { transformSync } = require('@babel/core');
 
 // Exercise the real service with controlled files and backend responses.
 // These checks do not replace Firebase or signed-device integration testing.
-function service(reply, files = {}) {
+function service(reply, files = {}, segments) {
   const calls = [];
   const schema = new Proxy({}, { get: () => (value) => value });
   const mocks = {
+    'react-native': { NativeModules: { LivePCMPlayer: segments ? { exportAudioSegments: async () => segments } : {} } },
     'expo-file-system': { File: class {
       constructor(uri) { Object.assign(this, files[uri] || { exists: false, size: 0 }); }
       async base64() { return 'dGVzdA=='; }
+      delete() { this.exists = false; }
     } },
     '@react-native-firebase/ai': {
       Schema: schema,
       getGenerativeModel: (_ai, config) => ({ generateContent: async (parts) => {
         calls.push({ config, parts });
-        if (reply instanceof Error) throw reply;
-        return { response: { text: () => typeof reply === 'string' ? reply : JSON.stringify(reply) } };
+        const response = Array.isArray(reply) ? reply[calls.length - 1] : reply;
+        if (response instanceof Error) throw response;
+        return { response: { candidates: [{finishReason: response?.finishReason || 'STOP'}], text: () => typeof response === 'string' ? response : JSON.stringify(response) } };
       } }),
     },
     './firebase': { initializeFirebaseServices: async () => ({ ai: {} }) },
@@ -94,4 +97,31 @@ test('malformed responses and backend outages surface retryable errors', async (
   await assert.rejects(service('not JSON').api.askPubli({ prompt: 'Question' }), /unreadable response/);
   await assert.rejects(service({ answer: '' }).api.askPubli({ prompt: 'Question' }), /did not return an answer/);
   await assert.rejects(service(new Error('Backend unavailable')).api.askPubli({ prompt: 'Question' }), /Backend unavailable/);
+});
+
+
+test('long recording transcribes every clip before editing and preserves its ending', async () => {
+  const { api, calls } = service([
+    { transcript: 'I moved here. I am trying to find opportunities' },
+    { transcript: 'trying to find opportunities to go out. My last thought is hope.' },
+    { polishedText: 'I moved here. I am trying to find opportunities to go out. My last thought is hope.', followUpQuestions: ['Why?', 'When?', 'How?'], suggestedTitle: 'Hope' },
+  ], { first: { exists: true, size: 10 }, second: { exists: true, size: 10 }, original: {exists:true,size:20} },
+  [{uri:'first', temporary:true}, {uri:'second', temporary:true}]);
+  const result = await api.analyzeRecording({uri:'original'});
+  assert.equal(result.transcript, 'I moved here. I am trying to find opportunities\n\nto go out. My last thought is hope.');
+  assert.match(result.polishedText, /last thought is hope/);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].config.generationConfig.temperature, 0);
+  assert.match(calls[2].parts, /My last thought is hope/);
+  assert.equal(calls[2].config.generationConfig.responseSchema.properties.transcript, undefined);
+});
+
+test('token-limited model replies cannot be saved as complete transcripts', async () => {
+  const {api} = service({ transcript:'Only the beginning', finishReason:'MAX_TOKENS' }, { audio:{exists:true,size:10} });
+  await assert.rejects(api.analyzeRecording({uri:'audio'}), /stopped before finishing/);
+});
+
+test('clip joining retains unmatched accented wording and uncertainty', () => {
+  const {api} = service({});
+  assert.equal(api.joinTranscriptClips(['I said [unclear].', 'I try go outside.']), 'I said [unclear].\n\nI try go outside.');
 });
