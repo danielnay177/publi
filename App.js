@@ -8,9 +8,14 @@ import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BlurView } from 'expo-blur';
 import { WebView } from 'react-native-webview';
-import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from 'expo-audio';
-import { auth } from './firebase';
-import { createUserWithEmailAndPassword, deleteUser, onAuthStateChanged, signInAnonymously, signInWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth';
+import { AudioModule, RecordingPresets, setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus, useAudioRecorder, useAudioRecorderState } from 'expo-audio';
+import * as Speech from 'expo-speech';
+import { auth, initializeFirebaseServices } from './firebase';
+import { createUserWithEmailAndPassword, deleteUser, onAuthStateChanged, signInAnonymously, signInWithEmailAndPassword, signOut, updateProfile } from '@react-native-firebase/auth';
+import { analyzeRecording, generateStoryOutline } from './aiService';
+import { subscribeDrafts, saveDraft as saveCloudDraft, deleteDraft, subscribeRecordings, subscribeVoiceStories, createVoiceStory, updateVoiceStory, deleteVoiceStory, applySuggestedVoiceStoryTitle, adoptRecordingAsVoiceStory, saveRecording, updateRecording, deleteRecording, downloadRecordingForAnalysis, saveProfile as saveCloudProfile, subscribeProfile, saveBookmarks, subscribeBookmarks, migrateLocalData, deleteCloudAccountData } from './cloudData';
+import DraftVoiceExperience, { TopicIdeas } from './DraftVoiceExperience';
+import DraftHomePrototype from './DraftHomePrototype';
 
 // Low-glare, warm charcoal palette for long writing sessions.
 const C = { bg: '#171C1B', paper: '#222927', ink: '#E7E8E1', muted: '#A7AEA7', line: '#39433E', green: '#91B69F', greenSoft: '#2C3C34', rust: '#D28A70', gold: '#D3B16C', cream: '#34352F', white: '#F5F3EC' };
@@ -18,18 +23,18 @@ const APP_VERSION = '1.0.0';
 const LEGAL_COPY = {
   'Terms of Service': [
     ['Using Publi', 'Publi is a writing workspace for exploring ideas, organizing research, and preparing stories. You must be at least 13 years old to use the app. You are responsible for your writing, how you use information from external sources, and anything you choose to submit or publish.'],
-    ['Your content', 'You keep ownership of the writing you create. Publi does not claim ownership of your drafts. In this release, drafts, profile details, and saved publications are stored on your device. Do not use the app as your only copy of important work.'],
+    ['Your content', 'You keep ownership of the writing you create. Publi does not claim ownership of your drafts. Drafts, voice recordings, profile details, and saved publications are synced to your Firebase account.'],
     ['Accounts', 'Keep your sign-in details secure. You may use an email account or an anonymous guest account. Guest accounts are tied to the current installation and may be difficult to recover if you lose access to the device. You can sign out or request account deletion in your profile.'],
     ['Acceptable use', 'Do not use Publi to break the law, infringe others’ rights, distribute malware, or interfere with the app or its users. External publications and resources are operated by third parties and have their own terms and editorial policies.'],
     ['Availability and liability', 'Publi is provided as-is while it is developed. Features may change, and we cannot guarantee uninterrupted access or that external links remain available. To the extent allowed by law, Publi is not liable for indirect or consequential loss arising from use of the app. Nothing in these terms limits rights that cannot legally be limited.'],
     ['Contact and updates', 'These terms may be updated as Publi develops. Continued use after an update means you accept the revised terms. The publisher’s support contact should be added here before public release.'],
   ],
   'Privacy Policy': [
-    ['What Publi stores', 'Your email address, Firebase user identifier, and (if provided) display name are processed by Firebase Authentication to sign you in. Drafts, profile details, and saved publications are stored locally on your device in this release; they are not synced to Publi servers.'],
+    ['What Publi stores', 'Firebase Authentication processes your email address, account identifier, and display name. Cloud Firestore stores drafts, transcripts, AI suggestions, profile details, and saved publications. Cloud Storage stores voice recordings in your account.'],
     ['Firebase', 'Authentication is provided by Google Firebase. Firebase receives information needed to create and maintain your account and protect the service. Review Google’s privacy information at policies.google.com/privacy. Publi does not use advertising or analytics in this release.'],
-    ['External links and recordings', 'Research, publication, and resource links open third-party websites that have their own privacy practices. Audio recording uses your device microphone only when you choose to record; recordings are not uploaded or transcribed by Publi.'],
-    ['Retention and deletion', 'You can remove your Firebase account from the profile screen. Account deletion permanently deletes the Firebase Authentication account and clears Publi’s locally stored profile, drafts, and bookmarks on this device. Removing the app also removes its local data.'],
-    ['Children, security, and changes', 'Publi is not designed for children under 13. We use Firebase Authentication and your device’s app storage to support the features described here, but no method of storage or transmission is completely secure. We will update this policy when the app’s data practices change.'],
+    ['External links and recordings', 'Research and publication links open third-party websites. When you finish a voice note, Publi uploads it to Firebase Storage and sends its audio and story context through Firebase AI Logic to Gemini for transcription, polishing, and follow-up questions. Ask publi saves your chats, voice messages, and attached photos in your Firebase account and sends questions and attachments to Gemini for answers. A working title is sent to Gemini to suggest an outline. AI output can be inaccurate; review it before using it.'],
+    ['Retention and deletion', 'You can delete your Firebase account from the profile screen. Account deletion removes your drafts, recordings, chats, attached photos, transcripts, suggestions, profile, and bookmarks from Firebase before removing the account.'],
+    ['Children, security, and changes', 'Publi is not designed for children under 13. We use Firebase Authentication and App Check to protect the service, but no method of storage or transmission is completely secure. We will update this policy when the app’s data practices change.'],
     ['Contact', 'For privacy questions, use the publisher’s support contact shown in the App Store listing. This policy is effective September 29, 2026.'],
   ],
   'About Publi': [
@@ -333,20 +338,25 @@ export default function App() {
   const welcomeOpacity = useRef(new Animated.Value(0)).current;
   const welcomeScale = useRef(new Animated.Value(0.82)).current;
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setFirebaseUser(user);
-      if (user) {
-        setProfileEmail(user.email || 'Guest account');
-        if (user.displayName) setProfileName(user.displayName);
-      }
-      setAuthReady(true);
-    });
+    let unsubscribe = () => {};
+    let cancelled = false;
+    initializeFirebaseServices().then(() => {
+      if (cancelled) return;
+      unsubscribe = onAuthStateChanged(auth, (user) => {
+        setFirebaseUser(user);
+        if (user) {
+          setProfileEmail(user.email || 'Guest account');
+          if (user.displayName) setProfileName(user.displayName);
+        }
+        setAuthReady(true);
+      });
+    }).catch((error) => { if (!cancelled) { setAuthReady(true); Alert.alert('Firebase is unavailable', error?.message || 'Please check this build’s Firebase configuration.'); } });
     Animated.parallel([
       Animated.timing(welcomeOpacity, { toValue: 1, duration: 1600, useNativeDriver: true }),
       Animated.spring(welcomeScale, { toValue: 1, friction: 8, tension: 22, useNativeDriver: true }),
     ]).start();
     const timer = setTimeout(() => setWelcomeDone(true), 2600);
-    return () => { unsubscribe(); clearTimeout(timer); };
+    return () => { cancelled = true; unsubscribe(); clearTimeout(timer); };
   }, []);
 
   const [tab, setTab] = useState('Home');
@@ -357,6 +367,27 @@ export default function App() {
   const [draftTitle, setDraftTitle] = useState('');
   const [editingDraftId, setEditingDraftId] = useState(null);
   const [questions, setQuestions] = useState([]);
+  const [outline, setOutline] = useState([]);
+  const [outlineBusy, setOutlineBusy] = useState(false);
+  const [recordings, setRecordings] = useState([]);
+  const [voiceStories, setVoiceStories] = useState([]);
+  const [voiceStoriesLoaded, setVoiceStoriesLoaded] = useState(false);
+  const [recordingsLoaded, setRecordingsLoaded] = useState(false);
+  const [activeVoiceStoryId, setActiveVoiceStoryId] = useState(null);
+  const [newVoiceStoryTitle, setNewVoiceStoryTitle] = useState('');
+  const [voiceStoryBusy, setVoiceStoryBusy] = useState(false);
+  const [topicIdeasOpen, setTopicIdeasOpen] = useState(false);
+  const [recordingBusy, setRecordingBusy] = useState(false);
+  const [recordingPaused, setRecordingPaused] = useState(false);
+  const [speakingQuestion, setSpeakingQuestion] = useState(false);
+  const [processingStage, setProcessingStage] = useState('');
+  const [pendingVoiceUpload, setPendingVoiceUpload] = useState(null);
+  const [selectedQuestion, setSelectedQuestion] = useState('');
+  const [playingRecordingId, setPlayingRecordingId] = useState(null);
+  const [loadingRecordingId, setLoadingRecordingId] = useState(null);
+  const [activeRecording, setActiveRecording] = useState(null);
+  const activeVoiceStory = voiceStories.find((story) => story.id === activeVoiceStoryId) || null;
+  const visibleVoiceRecordings = recordings.filter((item) => activeVoiceStoryId === 'legacy' ? !item.storyId : item.storyId === activeVoiceStoryId);
   const [genreFilter, setGenreFilter] = useState('All');
   const [search, setSearch] = useState('');
   const [bookmarks, setBookmarks] = useState([]);
@@ -370,9 +401,12 @@ export default function App() {
   const [browserTitle, setBrowserTitle] = useState('');
   const [canWebGoBack, setCanWebGoBack] = useState(false);
   const browserRef = useRef(null);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
-  const recorderState = useAudioRecorderState(recorder);
-  const cycleWidth = INSPIRATION.length * 216;
+  const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, numberOfChannels: 1, bitRate: 64000, isMeteringEnabled: true });
+  const recorderState = useAudioRecorderState(recorder, 150);
+  const player = useAudioPlayer(null);
+  const playerStatus = useAudioPlayerStatus(player);
+  const playbackFileRef = useRef(null);
+  const cycleWidth = INSPIRATION.length * 198;
   const inspirationOffset = useRef(new Animated.Value(-cycleWidth)).current;
   const inspirationPosition = useRef(-cycleWidth);
   const inspirationAnimation = useRef(null);
@@ -443,7 +477,7 @@ export default function App() {
       const localX = point.pageX - inspirationContainerLeft.current;
       let cardPosition = (localX - touchStartPosition.current) % cycleWidth;
       if (cardPosition < 0) cardPosition += cycleWidth;
-      const cardIndex = Math.floor(cardPosition / 216) % INSPIRATION.length;
+      const cardIndex = Math.floor(cardPosition / 198) % INSPIRATION.length;
       openExternal(INSPIRATION[cardIndex].url);
     }
     inspirationPosition.current = touchStartPosition.current;
@@ -458,7 +492,53 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => { AsyncStorage.multiGet(['publi.drafts', 'publi.profile.name', 'publi.profile.email', 'publi.bookmarks']).then(([d, n, e, b]) => { if (d?.[1]) setDrafts(JSON.parse(d[1])); if (n?.[1]) setProfileName(n[1]); if (e?.[1]) setProfileEmail(e[1]); if (b?.[1]) setBookmarks(JSON.parse(b[1])); }).catch(() => {}); }, []);
+  useEffect(() => {
+    if (!firebaseUser?.uid) {
+      setDrafts([]); setRecordings([]); setRecordingsLoaded(false); setVoiceStories([]); setVoiceStoriesLoaded(false); setActiveVoiceStoryId(null); setBookmarks([]); setProfileName('Writer');
+      setDraftTitle(''); setDraftText(''); setEditingDraftId(null); setQuestions([]); setOutline([]);
+      setActiveRecording(null); setSelectedQuestion(''); setPendingVoiceUpload(null); setPlayingRecordingId(null); player.pause();
+      return;
+    }
+    const uid = firebaseUser.uid;
+    const showSyncError = (error, source = 'account') => Alert.alert('Cloud sync unavailable', `${source}: ${error?.message || 'Please try again later.'}`);
+    const unsubscribers = [
+      subscribeDrafts(uid, setDrafts, (error) => showSyncError(error, 'drafts')),
+      subscribeRecordings(uid, (items) => { setRecordings(items); setRecordingsLoaded(true); }, (error) => showSyncError(error, 'recordings')),
+      subscribeVoiceStories(uid, (items) => { setVoiceStories(items); setVoiceStoriesLoaded(true); }, (error) => showSyncError(error, 'voice stories')),
+      subscribeBookmarks(uid, setBookmarks, (error) => showSyncError(error, 'bookmarks')),
+      subscribeProfile(uid, (profile) => { if (profile?.name) setProfileName(profile.name); }, (error) => showSyncError(error, 'profile')),
+    ];
+    AsyncStorage.multiGet(['publi.drafts', 'publi.profile.name', 'publi.profile.email', 'publi.bookmarks'])
+      .then((pairs) => {
+        if (pairs.some(([, value]) => value)) Alert.alert(
+          'Import work from this device?',
+          'Older Publi data on this device was not linked to an account. Import it into the account you are signed in with now?',
+          [
+            { text: 'Later', style: 'cancel' },
+            { text: 'Import', onPress: () => migrateLocalData(uid).catch(showSyncError) },
+          ],
+        );
+      }).catch(showSyncError);
+    return () => unsubscribers.forEach((unsubscribe) => unsubscribe?.());
+  }, [firebaseUser?.uid]);
+  useEffect(() => {
+    if (activeVoiceStoryId !== null || !voiceStoriesLoaded || !recordingsLoaded) return;
+    if (voiceStories.length) setActiveVoiceStoryId(voiceStories[0].id);
+    else if (recordings.some((item) => !item.storyId)) setActiveVoiceStoryId('legacy');
+    else setActiveVoiceStoryId('new');
+  }, [activeVoiceStoryId, voiceStories, recordings, voiceStoriesLoaded, recordingsLoaded]);
+  useEffect(() => {
+    const title = draftTitle.trim();
+    if (!firebaseUser?.uid || title.length < 3) { setOutline([]); setOutlineBusy(false); return; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setOutlineBusy(true);
+      try { const points = await generateStoryOutline(title); if (!cancelled) setOutline(points); }
+      catch (error) { if (!cancelled) { setOutline([]); Alert.alert('Could not build an outline', error?.message || 'Try again in a moment.'); } }
+      finally { if (!cancelled) setOutlineBusy(false); }
+    }, 1200);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [draftTitle, firebaseUser?.uid]);
   const go = (target) => { setTab(target); setProfileOpen(false); setInfoPage(null); };
   const openExternal = (url) => { setBrowserUrl(url); setBrowserCurrentUrl(url); setBrowserTitle(''); setBrowserInitialized(true); setBrowserOpen(true); };
   const closeBrowser = () => setBrowserOpen(false);
@@ -467,50 +547,287 @@ export default function App() {
     else closeBrowser();
     return true;
   };
-  const toggleBookmark = (name) => { const next = bookmarks.includes(name) ? bookmarks.filter((item) => item !== name) : [...bookmarks, name]; setBookmarks(next); AsyncStorage.setItem('publi.bookmarks', JSON.stringify(next)).catch(() => {}); };
+  const toggleBookmark = async (name) => {
+    if (!firebaseUser?.uid) return;
+    const next = bookmarks.includes(name) ? bookmarks.filter((item) => item !== name) : [...bookmarks, name];
+    try { await saveBookmarks(firebaseUser.uid, next); } catch (error) { Alert.alert('Could not save publication', error?.message || 'Please try again.'); }
+  };
   const saveDraft = async () => {
     if (!draftText.trim()) { Alert.alert('A first line is enough', 'Add a few thoughts before saving your draft.'); return; }
-    const updated = { id: editingDraftId || Date.now().toString(), title: draftTitle.trim() || draftText.trim().slice(0, 42), body: draftText.trim(), date: editingDraftId ? 'Updated just now' : 'Just now' };
-    const next = editingDraftId ? drafts.map((d) => d.id === editingDraftId ? updated : d) : [updated, ...drafts];
-    setDrafts(next); await AsyncStorage.setItem('publi.drafts', JSON.stringify(next)).catch(() => {});
-    setDraftTitle(''); setDraftText(''); setQuestions([]); setEditingDraftId(null); Alert.alert('Saved to Drafts', 'Your story is here whenever you want to pick it back up.');
-  };
-  const askQuestions = () => {
-    const words = draftText.trim().split(/\s+/).filter(Boolean);
-    if (words.length < 4) { Alert.alert('Tell me a little more', 'Add a few sentences first, then Publi will suggest three directions to explore.'); return; }
-    const topic = draftText.match(/(?:about|when|because|after|before|during|at|in)\s+([^.!?]{3,45})/i)?.[1]?.trim() || 'this experience';
-    setQuestions([
-      `What is the moment in “${topic}” you can still picture most clearly?`,
-      'What might someone who disagrees with your perspective say—and what would you want them to understand?',
-      'How did this change what you believe, do, or notice now?',
-    ]);
-  };
-  const toggleRecord = async () => {
     try {
-      if (recorderState.isRecording) { await recorder.stop(); Alert.alert('Recording saved', 'Your audio is ready. Transcription and AI follow-up will be available when Publi is connected to its AI service. For now, type or dictate your transcript in the notes area.'); }
-      else {
-        const permission = await AudioModule.requestRecordingPermissionsAsync();
-        if (!permission.granted) { Alert.alert('Microphone permission needed', 'Enable microphone access in Settings to record your thoughts.'); return; }
-        await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
-        await recorder.prepareToRecordAsync(); recorder.record();
-      }
-    } catch { Alert.alert('Could not start recording', 'Please try again on a device with microphone access.'); }
+      await saveCloudDraft(firebaseUser.uid, { id: editingDraftId || undefined, title: draftTitle.trim() || draftText.trim().slice(0, 42), body: draftText.trim() });
+      setDraftTitle(''); setDraftText(''); setQuestions([]); setOutline([]); setEditingDraftId(null);
+      Alert.alert('Saved to Drafts', 'Your story is here whenever you want to pick it back up.');
+    } catch (error) { Alert.alert('Could not save draft', error?.message || 'Please try again.'); }
   };
-  const removeDraft = (id) => Alert.alert('Delete this draft?', 'This cannot be undone.', [{ text: 'Keep draft', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: () => { const next = drafts.filter((d) => d.id !== id); setDrafts(next); AsyncStorage.setItem('publi.drafts', JSON.stringify(next)).catch(() => {}); if (editingDraftId === id) { setEditingDraftId(null); setDraftTitle(''); setDraftText(''); } } }]);
+  const askQuestions = async () => {
+    const topicTitle = draftTitle.trim() || activeVoiceStory?.title?.trim() || newVoiceStoryTitle.trim();
+    if (!topicTitle) { Alert.alert('Add a working title', 'A title gives Publi a topic for your outline.'); return; }
+    setOutlineBusy(true);
+    try { setOutline(await generateStoryOutline(topicTitle)); }
+    catch (error) { Alert.alert('Could not build an outline', error?.message || 'Please try again.'); }
+    finally { setOutlineBusy(false); }
+  };
+  const startVoiceRecording = async () => {
+    if (recordingBusy || voiceStoryBusy || pendingVoiceUpload || !firebaseUser?.uid) return false;
+    try {
+      const permission = await AudioModule.requestRecordingPermissionsAsync();
+      if (!permission.granted) { Alert.alert('Microphone permission needed', 'Enable microphone access in Settings to record your thoughts.'); return false; }
+      player.pause(); Speech.stop().catch(() => {}); setSpeakingQuestion(false);
+      await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
+      await recorder.prepareToRecordAsync();
+      recorder.record();
+      setRecordingPaused(false);
+      return true;
+    } catch (error) {
+      Alert.alert('Recording failed', error?.message || 'Please try again on a device with microphone access.');
+      return false;
+    }
+  };
+  const pauseVoiceRecording = () => {
+    try { recorder.pause(); setRecordingPaused(true); }
+    catch (error) { Alert.alert('Could not pause recording', error?.message || 'Please try again.'); }
+  };
+  const resumeVoiceRecording = () => {
+    try { recorder.record(); setRecordingPaused(false); }
+    catch (error) { Alert.alert('Could not resume recording', error?.message || 'Please try again.'); }
+  };
+  const cancelVoiceRecording = async () => {
+    try { await recorder.stop(); await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: false }); }
+    catch (error) { Alert.alert('Could not cancel recording', error?.message || 'Please try again.'); }
+    finally { setRecordingPaused(false); }
+  };
+  const uploadAndAnalyzeVoice = async (pending, onUploaded) => {
+    let saved;
+    let story = pending.story;
+    setRecordingBusy(true);
+    try {
+      setProcessingStage('Preparing your voice story…');
+      if (!story) {
+        story = await createVoiceStory(firebaseUser.uid, { title: pending.title });
+        setActiveVoiceStoryId(story.id);
+        setNewVoiceStoryTitle('');
+        setPendingVoiceUpload({ ...pending, story });
+      }
+      setProcessingStage('Uploading audio…');
+      saved = await saveRecording(firebaseUser.uid, {
+        uri: pending.uri, storyId: story.id, parentRecordingId: pending.parentRecordingId,
+        attemptIndex: pending.attemptIndex, prompt: pending.question,
+        durationMillis: pending.durationMillis,
+        onProgress: (fraction) => setProcessingStage(`Uploading audio… ${Math.round(fraction * 100)}%`),
+      });
+      setPendingVoiceUpload(null);
+      setActiveRecording(saved);
+      onUploaded?.(saved);
+      setProcessingStage('Transcribing and shaping your thought…');
+      const result = await analyzeRecording({
+        uri: pending.uri, mimeType: saved.contentType, title: story.title,
+        priorContext: [story.openingText, pending.context].filter(Boolean).join('\n\n'),
+        selectedQuestion: pending.question,
+      });
+      await updateRecording(firebaseUser.uid, saved.id, {
+        recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '),
+        transcript: result.transcript, polishedText: result.polishedText,
+        questions: result.followUpQuestions, status: 'ready', error: '',
+      });
+      saved = { ...saved, recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '), transcript: result.transcript, polishedText: result.polishedText, questions: result.followUpQuestions, status: 'ready' };
+      setActiveRecording(saved);
+      setSelectedQuestion('');
+      if (result.suggestedTitle) applySuggestedVoiceStoryTitle(firebaseUser.uid, story.id, result.suggestedTitle).catch(() => {});
+    } catch (error) {
+      if (saved) {
+        await updateRecording(firebaseUser.uid, saved.id, { status: 'error', error: error?.message || 'AI could not process this recording.' }).catch(() => {});
+        saved = { ...saved, status: 'error', error: error?.message || 'AI could not process this recording.' };
+        Alert.alert('Audio saved, AI needs a retry', error?.message || 'Your voice note is safe in its story.');
+      } else {
+        setPendingVoiceUpload({ ...pending, story });
+        Alert.alert('Recording still on this device', `${error?.message || 'Cloud upload failed.'} Tap Retry upload to save it.`);
+      }
+    } finally { setRecordingBusy(false); setProcessingStage(''); }
+    return saved || null;
+  };
+  const finishVoiceRecording = async ({ fresh = false, sourceRecording = null, question = '', onUploaded } = {}) => {
+    if (recordingBusy) return;
+    const durationMillis = recorderState.durationMillis;
+    try {
+      await recorder.stop();
+      setRecordingPaused(false);
+      const uri = recorder.uri;
+      if (!uri) throw new Error('The recording file could not be found.');
+      await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: false });
+      let story = fresh ? null : sourceRecording?.storyId
+        ? voiceStories.find((item) => item.id === sourceRecording.storyId) || null
+        : activeVoiceStory;
+      if (sourceRecording?.storyId && !story) {
+        throw new Error('This voice story is still syncing. Please try again in a moment.');
+      }
+      if (sourceRecording && !sourceRecording.storyId) {
+        story = await adoptRecordingAsVoiceStory(firebaseUser.uid, sourceRecording.id);
+      }
+      const storyRecordings = story ? recordings.filter((item) => item.storyId === story.id) : [];
+      const parent = fresh ? null : sourceRecording || (activeRecording?.storyId === story?.id ? activeRecording : storyRecordings[0] || null);
+      const pending = {
+        uri, durationMillis, story, title: fresh ? '' : newVoiceStoryTitle.trim(),
+        parentRecordingId: parent?.id || null,
+        attemptIndex: parent ? (parent.attemptIndex || 1) + 1 : 1,
+        question: sourceRecording ? question : selectedQuestion,
+        context: storyRecordings.map((item) => item.polishedText).filter(Boolean).reverse().join('\n\n'),
+      };
+      setPendingVoiceUpload(pending);
+      return await uploadAndAnalyzeVoice(pending, onUploaded);
+    } catch (error) { Alert.alert('Recording failed', error?.message || 'Please try again.'); return null; }
+  };
+  const retryVoiceUpload = async () => {
+    if (pendingVoiceUpload && !recordingBusy) return uploadAndAnalyzeVoice(pendingVoiceUpload);
+    return null;
+  };
+  const retryVoiceAnalysis = async (recording) => {
+    if (recordingBusy || !firebaseUser?.uid) return;
+    let localAudio;
+    setRecordingBusy(true);
+    setProcessingStage('Retrying transcription…');
+    try {
+      localAudio = await downloadRecordingForAnalysis(firebaseUser.uid, recording.storagePath);
+      const story = voiceStories.find((item) => item.id === recording.storyId);
+      const prior = recordings.filter((item) => item.storyId === recording.storyId && item.createdAtMs < recording.createdAtMs)
+        .sort((a, b) => a.createdAtMs - b.createdAtMs).map((item) => item.polishedText).filter(Boolean).join('\n\n');
+      const result = await analyzeRecording({
+        uri: localAudio.uri, mimeType: localAudio.mimeType,
+        title: story?.title || '', priorContext: [story?.openingText, prior].filter(Boolean).join('\n\n'),
+        selectedQuestion: recording.prompt || '',
+      });
+      await updateRecording(firebaseUser.uid, recording.id, {
+        recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '),
+        transcript: result.transcript, polishedText: result.polishedText,
+        questions: result.followUpQuestions, status: 'ready', error: '',
+      });
+      setActiveRecording({ ...recording, recordingTitle: result.suggestedTitle || result.polishedText.split(/\s+/).slice(0, 7).join(' '), transcript: result.transcript, polishedText: result.polishedText, questions: result.followUpQuestions, status: 'ready' });
+      if (story && result.suggestedTitle) applySuggestedVoiceStoryTitle(firebaseUser.uid, story.id, result.suggestedTitle).catch(() => {});
+    } catch (error) { Alert.alert('Could not retry AI', error?.message || 'Your audio is still saved. Please try again.'); }
+    finally {
+      try { localAudio?.cleanup(); } catch { /* Temporary file cleanup is best effort. */ }
+      setRecordingBusy(false); setProcessingStage('');
+    }
+  };
+  const selectVoiceQuestion = async (question, recording) => {
+    if (voiceStoryBusy) return false;
+    if (recording.storyId) {
+      setActiveVoiceStoryId(recording.storyId);
+      setActiveRecording(recording); setSelectedQuestion(question);
+      return true;
+    }
+    setVoiceStoryBusy(true);
+    try {
+      const story = await adoptRecordingAsVoiceStory(firebaseUser.uid, recording.id, { title: newVoiceStoryTitle.trim() });
+      setActiveVoiceStoryId(story.id);
+      setActiveRecording({ ...recording, storyId: story.id, attemptIndex: 1 });
+      setSelectedQuestion(question);
+      return true;
+    } catch (error) { Alert.alert('Could not continue this voice note', error?.message || 'Please try again.'); return false; }
+    finally { setVoiceStoryBusy(false); }
+  };
+  const chooseVoiceStory = (id) => {
+    if (recordingBusy || voiceStoryBusy || pendingVoiceUpload) return;
+    player.pause(); setPlayingRecordingId(null);
+    setActiveVoiceStoryId(id); setActiveRecording(null); setSelectedQuestion('');
+    if (id === 'new' || id === 'legacy') setNewVoiceStoryTitle('');
+    if (!draftTitle.trim()) setOutline([]);
+  };
+  const chooseTopicIdea = (idea) => {
+    chooseVoiceStory('new');
+    setSelectedQuestion(idea);
+    setTopicIdeasOpen(false);
+  };
+  const playRecording = async (recording) => {
+    let nextFile;
+    try {
+      if (loadingRecordingId) return;
+      if (playingRecordingId === recording.id) {
+        if (playerStatus.playing) player.pause();
+        else {
+          if (playerStatus.duration > 0 && playerStatus.currentTime >= playerStatus.duration - 0.2) await player.seekTo(0);
+          player.play();
+        }
+        return;
+      }
+      setLoadingRecordingId(recording.id);
+      await Speech.stop(); setSpeakingQuestion(false);
+      nextFile = await downloadRecordingForAnalysis(firebaseUser.uid, recording.storagePath);
+      player.pause();
+      player.replace({ uri: nextFile.uri });
+      playbackFileRef.current?.cleanup();
+      playbackFileRef.current = nextFile;
+      player.play();
+      setPlayingRecordingId(recording.id);
+    } catch (error) { nextFile?.cleanup(); Alert.alert('Could not play recording', error?.message || 'Please try again.'); }
+    finally { setLoadingRecordingId(null); }
+  };
+  const stopRecordingPlayback = () => {
+    player.pause();
+    // Native expo-audio cannot cast null in replace(). Keep the downloaded
+    // source until another recording replaces it, then remove the old cache.
+    player.seekTo(0).catch(() => {});
+    setPlayingRecordingId(null);
+  };
+  const editVoiceStoryTitle = async (story, recording, title) => {
+    if (story) await updateVoiceStory(firebaseUser.uid, story.id, { title });
+    else await updateRecording(firebaseUser.uid, recording.id, { recordingTitle: title });
+  };
+  const archiveVoiceStory = async (story, recording, archived) => {
+    const target = story || await adoptRecordingAsVoiceStory(firebaseUser.uid, recording.id, { title: recording.title });
+    await updateVoiceStory(firebaseUser.uid, target.id, { archived });
+    if (playingRecordingId && (recording.id === playingRecordingId || recordings.some(item => item.storyId === target.id && item.id === playingRecordingId))) stopRecordingPlayback();
+  };
+  const removeVoiceStory = async (story, recording) => {
+    if (playingRecordingId && (recording.id === playingRecordingId || recordings.some(item => item.storyId === story?.id && item.id === playingRecordingId))) stopRecordingPlayback();
+    if (story) await deleteVoiceStory(firebaseUser.uid, story.id);
+    else await deleteRecording(firebaseUser.uid, recording.id, recording.storagePath);
+  };
+  const speakVoiceQuestion = async (question) => {
+    try {
+      await Speech.stop();
+      player.pause(); setSpeakingQuestion(true);
+      Speech.speak(question, {
+        language: 'en-US', rate: 0.94,
+        onDone: () => setSpeakingQuestion(false),
+        onStopped: () => setSpeakingQuestion(false),
+        onError: () => setSpeakingQuestion(false),
+      });
+    } catch (error) { setSpeakingQuestion(false); Alert.alert('Could not read this question', error?.message || 'Please try again.'); }
+  };
+  const stopSpeakingQuestion = () => { Speech.stop().catch(() => {}); setSpeakingQuestion(false); };
+  const removeRecording = (recording) => Alert.alert('Delete this voice note?', 'This removes its audio and transcript from your account.', [
+    { text: 'Keep', style: 'cancel' },
+    { text: 'Delete', style: 'destructive', onPress: async () => {
+      try {
+        if (playingRecordingId === recording.id) { player.pause(); setPlayingRecordingId(null); }
+        await deleteRecording(firebaseUser.uid, recording.id, recording.storagePath);
+        if (activeRecording?.id === recording.id) { setActiveRecording(null); setQuestions([]); }
+      } catch (error) { Alert.alert('Could not delete recording', error?.message || 'Please try again.'); }
+    } },
+  ]);
+  const removeDraft = (id) => Alert.alert('Delete this draft?', 'This cannot be undone.', [{ text: 'Keep draft', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: async () => { try { await deleteDraft(firebaseUser.uid, id); if (editingDraftId === id) { setEditingDraftId(null); setDraftTitle(''); setDraftText(''); } } catch (error) { Alert.alert('Could not delete draft', error?.message || 'Please try again.'); } } }]);
   const saveProfile = async () => {
-    await AsyncStorage.multiSet([['publi.profile.name', profileName], ['publi.profile.email', profileEmail]]).catch(() => {});
-    try { if (auth.currentUser && profileName.trim()) await updateProfile(auth.currentUser, { displayName: profileName.trim() }); } catch (error) { Alert.alert('Name saved on this device', error?.message || 'Firebase could not update your name.'); }
-    setProfileEditing(false); Alert.alert('Profile saved', 'Your display name and local profile are updated.');
+    try {
+      if (auth.currentUser && profileName.trim()) await updateProfile(auth.currentUser, { displayName: profileName.trim() });
+      await saveCloudProfile(firebaseUser.uid, { name: profileName.trim(), email: firebaseUser.email || '' });
+      setProfileEditing(false); Alert.alert('Profile saved', 'Your display name is synced.');
+    } catch (error) { Alert.alert('Could not save profile', error?.message || 'Please try again.'); }
   };
   const clearLocalAccountData = async () => {
     await AsyncStorage.multiRemove(['publi.drafts', 'publi.profile.name', 'publi.profile.email', 'publi.bookmarks']).catch(() => {});
     setDrafts([]); setBookmarks([]); setProfileName('Writer'); setProfileEmail(''); setProfileEditing(false); setProfileOpen(false); setTab('Home');
   };
-  const deleteAccount = () => Alert.alert('Delete your Publi account?', 'This permanently deletes your Firebase account and removes Publi’s local profile, drafts, and saved publications from this device. This cannot be undone.', [
+  const deleteAccount = () => Alert.alert('Delete your Publi account?', 'This permanently deletes your account, drafts, voice recordings, and saved publications from Firebase. This cannot be undone.', [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Delete account', style: 'destructive', onPress: async () => {
       try {
         if (!auth.currentUser) throw new Error('You are already signed out.');
+        const signedInAt = Date.parse(auth.currentUser.metadata?.lastSignInTime || '');
+        if (!auth.currentUser.isAnonymous && Number.isFinite(signedInAt) && Date.now() - signedInAt > 4 * 60 * 1000) {
+          throw new Error('For your security, log out, sign in again, and retry account deletion. No cloud data has been removed.');
+        }
+        await deleteCloudAccountData(auth.currentUser.uid);
         await deleteUser(auth.currentUser);
         await clearLocalAccountData();
       } catch (error) {
@@ -521,7 +838,7 @@ export default function App() {
       }
     } },
   ]);
-  const logOut = () => Alert.alert('Log out of Publi?', 'Your drafts and saved publications will remain on this device.', [
+  const logOut = () => Alert.alert('Log out of Publi?', 'Your drafts and recordings will be ready when you sign in again.', [
     { text: 'Cancel', style: 'cancel' },
     { text: 'Log out', style: 'destructive', onPress: async () => { try { await signOut(auth); setProfileOpen(false); setProfileEditing(false); } catch (error) { Alert.alert('Could not log out', error?.message || 'Please try again.'); } } },
   ]);
@@ -564,6 +881,7 @@ export default function App() {
       <Pressable onPress={() => { setAuthError(''); setAuthMode('signup'); }} style={s.authPrimary}><Text style={s.authPrimaryText}>Create an account</Text><Ionicons name="arrow-forward" size={17} color={C.white} /></Pressable>
       <Pressable onPress={() => { setAuthError(''); setAuthMode('signin'); }} style={s.authSecondary}><Text style={s.authSecondaryText}>Sign in</Text></Pressable>
       <Pressable disabled={authBusy} onPress={continueAsGuest} style={s.guestButton}><Ionicons name="person-outline" size={17} color={C.green} /><Text style={s.guestText}>{authBusy ? 'Connecting…' : 'Continue as guest'}</Text></Pressable>
+      {!!authError && <Text style={s.authError}>{authError}</Text>}
       </> : <>
       <Pressable onPress={() => { setAuthMode('welcome'); setAuthError(''); }} style={s.infoBack}><Ionicons name="arrow-back" size={18} color={C.green} /><Text style={s.infoBackText}>Welcome</Text></Pressable>
       <Text style={s.authTitle}>{authMode === 'signup' ? 'Create your account.' : 'Welcome back.'}</Text><Text style={s.authDesc}>{authMode === 'signup' ? 'Save your place and keep shaping your story.' : 'Pick up where your next story begins.'}</Text>
@@ -612,18 +930,43 @@ export default function App() {
 
   const renderDraft = () => <>
     <View style={s.pageIntro}><Pill tint="#34352F" color="#D3B16C">THE NOTEBOOK</Pill><Text style={s.pageTitle}>Catch the thought.{ '\n' }Follow it further.</Text><Text style={s.pageDesc}>Speak or write freely. When you’re ready, we’ll help you find the next good question.</Text></View>
-    <View style={s.recordCard}><View style={s.recordTop}><View><Text style={s.eyebrow}>VOICE NOTE</Text><Text style={s.recordHeadline}>{recorderState.isRecording ? 'Listening to you…' : 'Say it out loud.'}</Text></View><View style={s.soundIcon}><Ionicons name={recorderState.isRecording ? 'radio' : 'pulse-outline'} size={22} color={C.rust} /></View></View>
-      <View style={s.waveBox}>{Array.from({ length: 31 }, (_, i) => <View key={i} style={[s.waveBar, { height: recorderState.isRecording ? 7 + ((i * 11) % 32) : 6 + ((i * 7) % 20), backgroundColor: recorderState.isRecording && i % 3 === 0 ? C.rust : '#53635A' }]} />)}</View>
-      <Text style={s.recordHint}>{recorderState.isRecording ? 'Recording on this device · Tap to finish' : recorderState.durationMillis ? 'Audio captured on this device' : 'No outline needed. Start wherever you are.'}</Text>
-      <Pressable onPress={toggleRecord} style={[s.recordButton, recorderState.isRecording && s.recordButtonActive]}><Ionicons name={recorderState.isRecording ? 'stop' : 'mic'} size={19} color={C.white} /><Text style={s.recordButtonText}>{recorderState.isRecording ? 'Stop recording' : 'Start a voice note'}</Text></Pressable>
-      <Text style={s.aiNote}>Audio stays on your device. AI transcription isn’t connected yet.</Text>
+    <View style={s.voiceStoryHeader}>
+      <View style={{ flex: 1 }}><Text style={s.eyebrow}>VOICE STORIES</Text><Text style={s.voiceStoryHeading}>A place to think aloud.</Text></View>
+      <Pressable accessibilityRole="button" accessibilityLabel="New voice story" onPress={() => chooseVoiceStory('new')} disabled={recordingBusy || voiceStoryBusy} style={s.newVoiceStoryButton}><Ionicons name="add" size={17} color={C.bg} /><Text style={s.newVoiceStoryButtonText}>New story</Text></Pressable>
     </View>
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.voiceStoryPicker} contentContainerStyle={s.voiceStoryPickerContent}>
+      {voiceStories.map((story) => <Pressable key={story.id} accessibilityRole="button" accessibilityState={{ selected: activeVoiceStoryId === story.id }} onPress={() => chooseVoiceStory(story.id)} style={[s.voiceStoryChip, activeVoiceStoryId === story.id && s.voiceStoryChipSelected]}><Text numberOfLines={1} style={[s.voiceStoryChipText, activeVoiceStoryId === story.id && s.voiceStoryChipTextSelected]}>{story.title || 'Untitled voice story'}</Text></Pressable>)}
+      {recordings.some((item) => !item.storyId) && <Pressable accessibilityRole="button" accessibilityState={{ selected: activeVoiceStoryId === 'legacy' }} onPress={() => chooseVoiceStory('legacy')} style={[s.voiceStoryChip, activeVoiceStoryId === 'legacy' && s.voiceStoryChipSelected]}><Text style={[s.voiceStoryChipText, activeVoiceStoryId === 'legacy' && s.voiceStoryChipTextSelected]}>Earlier notes</Text></Pressable>}
+      {activeVoiceStoryId === 'new' && <View style={[s.voiceStoryChip, s.voiceStoryChipSelected]}><Text style={s.voiceStoryChipTextSelected}>New story</Text></View>}
+    </ScrollView>
+    {activeVoiceStory ? <View style={s.voiceStoryTitleCard}><Text style={s.eyebrow}>STORY TITLE</Text><TextInput key={`${activeVoiceStory.id}-${activeVoiceStory.title}`} defaultValue={activeVoiceStory.title} onEndEditing={(event) => updateVoiceStory(firebaseUser.uid, activeVoiceStory.id, { title: event.nativeEvent.text }).catch((error) => Alert.alert('Could not save title', error?.message || 'Please try again.'))} placeholder="Give this voice story a title…" placeholderTextColor={C.muted} style={s.voiceStoryTitleInput} /></View> : activeVoiceStoryId !== 'legacy' && <View style={s.voiceStoryTitleCard}><Text style={s.eyebrow}>OPTIONAL TITLE</Text><TextInput value={newVoiceStoryTitle} onChangeText={setNewVoiceStoryTitle} placeholder="Name this thought, or let Publi suggest a title…" placeholderTextColor={C.muted} style={s.voiceStoryTitleInput} /></View>}
+    <Pressable accessibilityRole="button" accessibilityLabel="Open topic ideas" onPress={() => setTopicIdeasOpen(true)} style={s.topicIdeasButton}><View style={s.topicIdeasIcon}><Ionicons name="sparkles-outline" size={19} color={C.gold} /></View><View style={{ flex: 1 }}><Text style={s.eyebrow}>NEED A SPARK?</Text><Text style={s.topicIdeasTitle}>Topic ideas</Text><Text style={s.topicIdeasHint}>Explore your AI outline and ways to begin.</Text></View><Ionicons name="chevron-forward" size={19} color={C.green} /></Pressable>
+    <DraftVoiceExperience
+      recordings={visibleVoiceRecordings} activeRecording={activeRecording}
+      selectedQuestion={selectedQuestion} title={activeVoiceStory?.title || newVoiceStoryTitle}
+      onSelectQuestion={selectVoiceQuestion} onStart={startVoiceRecording}
+      onFinish={finishVoiceRecording} onCancel={cancelVoiceRecording}
+      onPause={pauseVoiceRecording} onResume={resumeVoiceRecording}
+      onSpeakQuestion={speakVoiceQuestion} onStopSpeaking={stopSpeakingQuestion} speaking={speakingQuestion}
+      isRecording={recorderState.isRecording} isPaused={recordingPaused}
+      durationMillis={recorderState.durationMillis} recordingBusy={recordingBusy || voiceStoryBusy}
+      processingStage={processingStage} pendingUpload={!!pendingVoiceUpload}
+      onRetryUpload={retryVoiceUpload} onRetryAnalysis={retryVoiceAnalysis}
+      playingRecordingId={playingRecordingId}
+      isPlaying={playerStatus.playing} onPlay={playRecording} onDelete={removeRecording}
+    />
     <View style={s.editorCard}><View style={s.editorHeader}><View style={s.editorBadge}><Ionicons name="create-outline" size={16} color={C.green} /></View><Text style={s.editorLabel}>OR WRITE IT DOWN</Text><Text style={s.wordCount}>{draftText.trim() ? draftText.trim().split(/\s+/).length : 0} words</Text></View>
       <TextInput value={draftTitle} onChangeText={setDraftTitle} placeholder="Give this story a working title…" placeholderTextColor="#969187" style={s.titleInput} />
       <TextInput value={draftText} onChangeText={(v) => { setDraftText(v); setQuestions([]); }} placeholder="Start with a moment, a question, or something you can’t stop thinking about…" placeholderTextColor="#969187" style={s.bodyInput} multiline textAlignVertical="top" />
-      <View style={s.editorActions}><Pressable onPress={askQuestions} style={s.secondaryButton}><Ionicons name="sparkles-outline" size={16} color={C.green} /><Text style={s.secondaryButtonText}>Help me explore</Text></Pressable><Pressable onPress={saveDraft} style={s.saveButton}><Text style={s.saveButtonText}>{editingDraftId ? 'Update draft' : 'Save draft'}</Text></Pressable></View>
+      <View style={s.editorActions}><Pressable onPress={askQuestions} disabled={outlineBusy} style={s.secondaryButton}><Ionicons name="sparkles-outline" size={16} color={C.green} /><Text style={s.secondaryButtonText}>{outlineBusy ? 'Thinking…' : 'Build an outline'}</Text></Pressable><Pressable onPress={saveDraft} style={s.saveButton}><Text style={s.saveButtonText}>{editingDraftId ? 'Update draft' : 'Save draft'}</Text></Pressable></View>
     </View>
-    {questions.length > 0 && <View style={s.questionsCard}><View style={s.questionHeader}><View><Text style={s.eyebrow}>THREE WAYS TO GO DEEPER</Text><Text style={s.questionTitle}>Follow the thread.</Text></View><Ionicons name="sparkles" size={20} color={C.gold} /></View>{questions.map((q, i) => <Pressable onPress={() => setDraftText(prev => `${prev.trim()}\n\n${q}\n`)} key={q} style={s.questionRow}><View style={s.questionNumber}><Text style={s.questionNumberText}>0{i + 1}</Text></View><Text style={s.questionText}>{q}</Text><Ionicons name="add-circle-outline" size={19} color={C.green} /></Pressable>)}</View>}
+    {outline.length > 0 && <View style={s.questionsCard}><View style={s.questionHeader}><View><Text style={s.eyebrow}>TEN THREADS TO EXPLORE</Text><Text style={s.questionTitle}>A working outline.</Text></View><Ionicons name="sparkles" size={20} color={C.gold} /></View>{outline.map((point, i) => <View key={`${i}-${point}`} style={s.questionRow}><View style={s.questionNumber}><Text style={s.questionNumberText}>{i + 1}</Text></View><Text style={s.questionText}>{point}</Text></View>)}</View>}
+    <Modal visible={topicIdeasOpen} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setTopicIdeasOpen(false)}>
+      <SafeAreaProvider><SafeAreaView edges={['top', 'bottom']} style={s.topicIdeasModal}>
+        <View style={s.topicIdeasToolbar}><Pressable accessibilityRole="button" accessibilityLabel="Close topic ideas" onPress={() => setTopicIdeasOpen(false)} style={s.topicIdeasBack}><Ionicons name="arrow-back" size={21} color={C.ink} /></Pressable><Text style={s.topicIdeasToolbarTitle}>Topic ideas</Text><View style={s.topicIdeasBack} /></View>
+        <ScrollView contentContainerStyle={s.topicIdeasScroll}><TopicIdeas outline={outline} onChooseTopic={chooseTopicIdea} onBuildOutline={askQuestions} loading={outlineBusy} title={draftTitle || activeVoiceStory?.title || newVoiceStoryTitle} /></ScrollView>
+      </SafeAreaView></SafeAreaProvider>
+    </Modal>
     <SectionTitle eyebrow="SAFE ON YOUR DESK" title="Your saved drafts" action={drafts.length ? `${drafts.length} saved` : undefined} />
     {drafts.length === 0 ? <View style={s.emptyCard}><Ionicons name="documents-outline" size={25} color={C.muted} /><Text style={s.emptyTitle}>Nothing saved yet.</Text><Text style={s.emptyBody}>The first draft is always the hardest. Save it here when you’re ready.</Text></View> : drafts.map(d => <View key={d.id} style={s.draftItem}><Pressable onPress={() => { setEditingDraftId(d.id); setDraftTitle(d.title); setDraftText(d.body); setQuestions([]); }} style={{ flex: 1 }}><Text style={s.linkName}>{d.title}</Text><Text style={s.cardSub}>{d.date} · {d.body.length} characters</Text></Pressable><Pressable onPress={() => removeDraft(d.id)} hitSlop={10}><Ionicons name="trash-outline" size={18} color={C.muted} /></Pressable></View>)}
   </>;
@@ -660,7 +1003,7 @@ export default function App() {
   const renderProfile = () => <>
     <View style={s.profileHero}><Pressable accessibilityRole="button" accessibilityLabel="Back" onPress={() => { setProfileOpen(false); setProfileEditing(false); }} style={s.glassBackButton}><BlurView intensity={88} tint="dark" style={StyleSheet.absoluteFillObject} /><View pointerEvents="none" style={s.glassButtonShine} /><Ionicons name="arrow-back" size={19} color={C.ink} /></Pressable><View style={s.profileAvatarLarge}><Text style={s.profileInitial}>{(profileName[0] || 'A').toUpperCase()}</Text></View><Text style={s.profileTitle}>{profileName}</Text><Text style={s.profileSubtitle}>YOUR WRITER’S DESK</Text></View>
     {infoPage ? <><Pressable onPress={() => setInfoPage(null)} style={s.infoBack}><Ionicons name="arrow-back" size={18} color={C.green} /><Text style={s.infoBackText}>Back to profile</Text></Pressable><Text style={s.profileInfoTitle}>{infoPage}</Text>{LEGAL_COPY[infoPage].map(([heading, body]) => <View key={heading} style={s.legalSection}><Text style={s.legalHeading}>{heading}</Text><Text style={s.legalBody}>{body}</Text></View>)}</> : <>
-    {profileEditing && <View style={s.profileCard}><Text style={s.eyebrow}>EDIT YOUR PROFILE</Text><Text style={s.formLabel}>Display name</Text><TextInput value={profileName} onChangeText={setProfileName} style={s.profileInput} placeholder="Your name" /><Text style={s.formLabel}>Signed in as</Text><Text style={s.profileEmailValue}>{firebaseUser?.email || 'Guest account'}</Text><Text style={s.profileNote}>Your display name is saved to Firebase. Drafts and saved publications remain on this device.</Text><Pressable onPress={saveProfile} style={s.primaryButton}><Text style={s.primaryButtonText}>Save profile</Text><Ionicons name="checkmark" size={18} color={C.white} /></Pressable></View>}
+    {profileEditing && <View style={s.profileCard}><Text style={s.eyebrow}>EDIT YOUR PROFILE</Text><Text style={s.formLabel}>Display name</Text><TextInput value={profileName} onChangeText={setProfileName} style={s.profileInput} placeholder="Your name" /><Text style={s.formLabel}>Signed in as</Text><Text style={s.profileEmailValue}>{firebaseUser?.email || 'Guest account'}</Text><Text style={s.profileNote}>Your profile, drafts, recordings, and saved publications sync to Firebase.</Text><Pressable onPress={saveProfile} style={s.primaryButton}><Text style={s.primaryButtonText}>Save profile</Text><Ionicons name="checkmark" size={18} color={C.white} /></Pressable></View>}
     <View style={s.settingsGroup}><Text style={s.eyebrow}>YOUR PUBLI</Text>
       <Pressable onPress={() => go('Draft')} style={s.settingsRow}><Ionicons name="documents-outline" size={19} color={C.green} /><Text style={s.settingsText}>My drafts</Text><Text style={s.settingsValue}>{drafts.length}</Text><Ionicons name="chevron-forward" size={17} color={C.muted} /></Pressable>
       <Pressable onPress={() => { setSavedOnly(true); go('Research'); }} style={s.settingsRow}><Ionicons name="bookmark-outline" size={19} color={C.green} /><Text style={s.settingsText}>Reading room</Text><Text style={s.settingsValue}>{bookmarks.length}</Text><Ionicons name="chevron-forward" size={17} color={C.muted} /></Pressable>
@@ -674,12 +1017,28 @@ export default function App() {
     <View style={s.profileFooter}><Text style={s.profileFooterBrand}>publi.</Text><Text style={s.profileFooterVersion}>Version {APP_VERSION}</Text><Text style={s.version}>MADE FOR THE STORIES THAT MATTER</Text></View></>}
   </>;
 
-  const content = profileOpen ? renderProfile() : tab === 'Home' ? renderHome() : tab === 'Research' ? renderResearch() : tab === 'Draft' ? renderDraft() : tab === 'Coach' ? renderCoach() : renderPitch();
+  const content = profileOpen ? renderProfile() : tab === 'Home' ? renderHome() : tab === 'Research' ? renderResearch() : tab === 'Draft' ? null : tab === 'Coach' ? renderCoach() : renderPitch();
   return <SafeAreaView edges={['top']} style={s.safe}>
     <StatusBar barStyle="light-content" backgroundColor={C.bg} />
     <View style={s.appLayer} pointerEvents={browserOpen ? 'none' : 'auto'}>
+      {tab === 'Draft' && !profileOpen ? <DraftHomePrototype
+        onExit={() => go('Home')} uid={firebaseUser?.uid} recordings={recordings} voiceStories={voiceStories}
+        onStartRecording={startVoiceRecording} onPauseRecording={pauseVoiceRecording}
+        onResumeRecording={resumeVoiceRecording} onCancelRecording={cancelVoiceRecording}
+        onFinishRecording={finishVoiceRecording} isRecording={recorderState.isRecording}
+        isPaused={recordingPaused} durationMillis={recorderState.durationMillis} metering={recorderState.metering}
+        recordingBusy={recordingBusy || voiceStoryBusy} processingStage={processingStage}
+        pendingUpload={!!pendingVoiceUpload} onRetryUpload={retryVoiceUpload}
+        onRetryAnalysis={retryVoiceAnalysis} onPlayRecording={playRecording}
+        playingRecordingId={playingRecordingId} isPlaying={playerStatus.playing}
+        loadingRecordingId={loadingRecordingId}
+        playbackPosition={playerStatus.currentTime || 0} playbackDuration={playerStatus.duration || 0}
+        onStopPlayback={stopRecordingPlayback} onEditStoryTitle={editVoiceStoryTitle}
+        onArchiveStory={archiveVoiceStory} onDeleteStory={removeVoiceStory}
+      /> : <>
       {!profileOpen && <Header onProfile={() => { setProfileEditing(false); setInfoPage(null); setProfileOpen(true); }} initial={profileName} subtitle={tab === 'Home' ? 'YOUR STORY, IN PRINT' : `${tab.toUpperCase()} · THE PUBLI DESK`} />}
       <ScrollView key={`${tab}-${profileOpen}`} style={s.scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>{content}</ScrollView>
+      </>}
       {!profileOpen && <View style={s.tabBarFrame}>
         <BlurView intensity={92} tint="dark" style={s.tabBar}>
           <View pointerEvents="none" style={s.tabGlassHighlight} />
@@ -732,15 +1091,43 @@ const s = StyleSheet.create({
   launchScreen: { flex: 1, backgroundColor: C.bg, justifyContent: 'center', alignItems: 'center' }, launchMark: { width: 106, height: 106, borderRadius: 32, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center' }, launchQuote: { position: 'absolute', top: 6, right: 17 }, launchQuoteText: { color: C.rust, fontFamily: 'Georgia', fontSize: 36, fontWeight: '700' }, launchWordmark: { fontFamily: 'Georgia', color: C.ink, fontWeight: '700', fontSize: 37, letterSpacing: -1.5, marginTop: 21 }, launchTag: { color: C.muted, fontSize: 8, fontWeight: '800', letterSpacing: 2, marginTop: 7 },
   authScreen: { flex: 1, backgroundColor: C.bg }, authScroll: { flexGrow: 1, paddingHorizontal: 27, paddingTop: 25, paddingBottom: 24 }, authBrand: { alignItems: 'center', marginBottom: 45 }, authMark: { height: 61, width: 61, borderRadius: 19, backgroundColor: C.green, alignItems: 'center', justifyContent: 'center' }, authMarkQuote: { position: 'absolute', right: 8, top: 1, fontFamily: 'Georgia', fontSize: 23, color: C.rust, fontWeight: '700' }, authWordmark: { fontFamily: 'Georgia', color: C.ink, fontWeight: '700', fontSize: 27, marginTop: 8 }, authTag: { color: C.muted, fontSize: 7, fontWeight: '800', letterSpacing: 1.6, marginTop: 2 }, authTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 31, lineHeight: 37, letterSpacing: -.6, marginTop: 4 }, authDesc: { color: '#B9BDB5', fontSize: 13, lineHeight: 20, marginTop: 10, marginBottom: 22 }, authPrimary: { height: 51, borderRadius: 5, backgroundColor: C.green, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, marginTop: 10 }, authPrimaryText: { color: C.white, fontWeight: '800', fontSize: 13 }, authSecondary: { minHeight: 48, alignItems: 'center', justifyContent: 'center', marginTop: 5 }, authSecondaryText: { color: C.green, fontSize: 12, fontWeight: '700' }, guestButton: { flexDirection: 'row', gap: 8, alignItems: 'center', justifyContent: 'center', paddingVertical: 13, borderTopWidth: 1, borderColor: C.line, marginTop: 8 }, guestText: { color: C.green, fontSize: 12, fontWeight: '700' }, authInput: { height: 49, paddingHorizontal: 13, borderWidth: 1, borderColor: C.line, borderRadius: 7, backgroundColor: C.paper, color: C.ink, fontSize: 13, marginBottom: 10 }, authError: { color: '#E4A38C', fontSize: 11, lineHeight: 16, marginTop: 0, marginBottom: 4 }, authLegal: { flexDirection: 'row', flexWrap: 'wrap', gap: 4, justifyContent: 'center', alignItems: 'center', marginTop: 24 }, authLegalText: { color: C.muted, fontSize: 9 }, authLegalLink: { color: C.green, fontSize: 9, textDecorationLine: 'underline' }, aboutLink: { alignSelf: 'center', paddingVertical: 15 }, aboutLinkText: { color: C.muted, fontSize: 10 }, infoBack: { flexDirection: 'row', gap: 6, alignItems: 'center', alignSelf: 'flex-start', paddingVertical: 9, marginBottom: 8 }, infoBackText: { color: C.green, fontSize: 11, fontWeight: '700' }, legalSection: { marginTop: 17 }, legalHeading: { color: C.ink, fontFamily: 'Georgia', fontSize: 17, marginBottom: 6 }, legalBody: { color: '#B9BDB5', fontSize: 12, lineHeight: 19 }, profileInfoTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 28, marginTop: 2, marginBottom: 3 }, profileEmailValue: { color: C.ink, fontSize: 12, minHeight: 42, paddingVertical: 12, paddingHorizontal: 11, backgroundColor: '#1D2422', borderWidth: 1, borderColor: C.line, borderRadius: 9 },
   header: { paddingHorizontal: 22, paddingTop: 8, paddingBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, brand: { fontSize: 30, lineHeight: 32, color: C.ink, fontFamily: 'Georgia', fontWeight: '700', letterSpacing: -1.5 }, headerSub: { fontSize: 8, letterSpacing: 1.8, fontWeight: '700', color: C.muted, marginTop: 3 }, avatar: { width: 39, height: 39, borderRadius: 20, backgroundColor: '#303733', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: C.line }, avatarText: { fontFamily: 'Georgia', fontSize: 17, color: C.green, fontWeight: '700' }, onlineDot: { position: 'absolute', width: 9, height: 9, borderRadius: 5, backgroundColor: '#76A077', right: 0, bottom: 0, borderWidth: 1.5, borderColor: C.bg },
-  welcome: { backgroundColor: '#292F2D', borderRadius: 16, padding: 23, minHeight: 344, marginTop: 12, marginBottom: 18, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,.1)', shadowColor: '#77674D', shadowOpacity: .11, shadowRadius: 15, shadowOffset: { width: 0, height: 7 }, elevation: 3 }, welcomeTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, welcomeIssue: { color: '#ADB0A4', fontSize: 8, fontWeight: '700', letterSpacing: 1 }, pill: { alignSelf: 'flex-start', borderRadius: 12, paddingVertical: 6, paddingHorizontal: 9 }, pillText: { fontSize: 8, letterSpacing: 1.1, fontWeight: '800' }, heroTitle: { position: 'relative', zIndex: 2, fontFamily: 'Georgia', fontSize: 39, lineHeight: 42, color: C.ink, fontWeight: '500', marginTop: 23, letterSpacing: -1.8, maxWidth: 260 }, heroItalic: { fontStyle: 'italic', color: C.green }, heroBody: { position: 'relative', zIndex: 2, fontSize: 13, lineHeight: 20, color: '#C0C4BC', marginTop: 12, maxWidth: 282 }, primaryButton: { position: 'relative', zIndex: 2, alignSelf: 'flex-start', backgroundColor: C.green, borderRadius: 13, flexDirection: 'row', alignItems: 'center', gap: 13, paddingVertical: 13, paddingHorizontal: 17, marginTop: 19, shadowColor: C.green, shadowOpacity: .2, shadowRadius: 7, shadowOffset: { width: 0, height: 4 }, elevation: 3 }, primaryButtonText: { color: C.white, fontSize: 12, fontWeight: '700', letterSpacing: 0.15 }, welcomeDecor: { position: 'absolute', width: 144, height: 144, borderRadius: 76, backgroundColor: 'rgba(194, 157, 103, 0.15)', bottom: -57, right: -23, alignItems: 'center', justifyContent: 'center' }, decorCircle: { width: 104, height: 104, borderRadius: 52, borderWidth: 1, borderColor: 'rgba(144, 111, 66, 0.3)' }, decorQuote: { position: 'absolute', fontFamily: 'Georgia', fontSize: 90, color: 'rgba(144, 111, 66, 0.27)', top: 2, left: 49 },
-  homeStats: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderColor: C.line, paddingBottom: 23, marginBottom: 29 }, statNum: { fontFamily: 'Georgia', color: C.ink, fontSize: 25 }, statLabel: { marginTop: 4, fontSize: 8, letterSpacing: 1, color: C.muted, fontWeight: '700' }, statRule: { width: 1, height: 36, backgroundColor: C.line, marginHorizontal: 24 }, sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 14, marginTop: 4 }, eyebrow: { fontSize: 8, letterSpacing: 1.45, fontWeight: '800', color: C.muted }, sectionTitle: { fontFamily: 'Georgia', fontSize: 23, lineHeight: 28, color: C.ink, marginTop: 5, letterSpacing: -0.35 }, link: { color: C.green, fontSize: 11, fontWeight: '700', marginBottom: 4 }, inspirationIntro: { color: C.muted, fontSize: 11, lineHeight: 16, marginTop: -6, marginBottom: 12 }, communityIntro: { color: C.muted, fontSize: 11, lineHeight: 16, marginTop: -6, marginBottom: 12 }, communityCard: { backgroundColor: C.paper, borderRadius: 14, padding: 15, marginBottom: 10, borderWidth: 1, borderColor: C.line, shadowColor: '#000000', shadowOpacity: .12, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, communityTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, communityIcon: { width: 42, height: 42, borderRadius: 14, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)' }, communityTag: { color: C.muted, fontSize: 8, letterSpacing: 1, fontWeight: '800' }, communityName: { color: C.ink, fontFamily: 'Georgia', fontSize: 19, lineHeight: 24, marginTop: 12 }, communityDetail: { color: C.muted, fontSize: 11, lineHeight: 17, marginTop: 6 }, communityAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: C.line, paddingTop: 11, marginTop: 12 }, communityActionText: { color: C.green, fontSize: 10, fontWeight: '700' }, inspirationViewport: { overflow: 'hidden', marginBottom: 27 }, inspirationTrack: { flexDirection: 'row', alignItems: 'stretch' }, inspirationCard: { width: 205, minHeight: 286, marginRight: 11, borderRadius: 15, padding: 15, position: 'relative', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .1, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 3 }, inspirationIcon: { width: 39, height: 39, borderRadius: 13, backgroundColor: 'rgba(255,255,255,0.06)', alignItems: 'center', justifyContent: 'center', marginBottom: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,.12)', shadowColor: '#51432F', shadowOpacity: .13, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, mediaPreview: { width: '100%', height: 92, borderRadius: 8, marginBottom: 12, backgroundColor: 'rgba(255,255,255,.06)' }, bookCover: { width: 70, height: 98, borderRadius: 4, marginBottom: 12, backgroundColor: 'rgba(255,255,255,.06)', shadowColor: '#51432F', shadowOpacity: .18, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 3 }, inspirationType: { color: '#B7B5A9', fontSize: 8, fontWeight: '800', letterSpacing: 1 }, inspirationTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 20, marginTop: 5 }, inspirationDetail: { color: '#B9BDB5', fontSize: 11, lineHeight: 16, marginTop: 7, paddingRight: 8, flex: 1 }, inspirationAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: 'rgba(49,92,75,.18)', paddingTop: 10, marginTop: 13 }, inspirationActionText: { color: C.green, fontSize: 10, fontWeight: '700' }, genreRow: { flexDirection: 'row', gap: 11, marginBottom: 26 }, genreMini: { backgroundColor: C.paper, flex: 1, borderRadius: 14, padding: 14, minHeight: 151, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .08, shadowRadius: 9, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, genreIcon: { width: 42, height: 42, borderRadius: 15, justifyContent: 'center', alignItems: 'center', marginBottom: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,.1)', shadowColor: '#51432F', shadowOpacity: .14, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, genreTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 16 }, genreDescription: { color: C.muted, fontSize: 10, lineHeight: 14, marginTop: 5 }, savedTeaser: { backgroundColor: C.paper, padding: 13, borderRadius: 13, flexDirection: 'row', gap: 11, alignItems: 'center', marginBottom: 23, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .08, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, savedIcon: { width: 41, height: 41, borderRadius: 15, backgroundColor: C.greenSoft, justifyContent: 'center', alignItems: 'center', shadowColor: C.green, shadowOpacity: .14, shadowRadius: 5, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, bottomQuote: { borderTopWidth: 1, borderColor: C.line, paddingTop: 19, marginTop: 6 }, quoteMark: { color: C.rust, fontFamily: 'Georgia', fontSize: 45, height: 34 }, quoteText: { fontFamily: 'Georgia', fontStyle: 'italic', fontSize: 19, lineHeight: 27, color: C.ink }, quoteBy: { marginTop: 10, fontSize: 8, letterSpacing: 1.5, color: C.muted, fontWeight: '800' },
+  welcome: { backgroundColor: '#292F2D', borderRadius: 16, padding: 20, minHeight: 320, marginTop: 12, marginBottom: 16, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,.1)', shadowColor: '#77674D', shadowOpacity: .11, shadowRadius: 15, shadowOffset: { width: 0, height: 7 }, elevation: 3 }, welcomeTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, welcomeIssue: { color: '#ADB0A4', fontSize: 8, fontWeight: '700', letterSpacing: 1 }, pill: { alignSelf: 'flex-start', borderRadius: 12, paddingVertical: 6, paddingHorizontal: 9 }, pillText: { fontSize: 8, letterSpacing: 1.1, fontWeight: '800' }, heroTitle: { position: 'relative', zIndex: 2, fontFamily: 'Georgia', fontSize: 36, lineHeight: 40, color: C.ink, fontWeight: '500', marginTop: 20, letterSpacing: -1.8, maxWidth: 260 }, heroItalic: { fontStyle: 'italic', color: C.green }, heroBody: { position: 'relative', zIndex: 2, fontSize: 13, lineHeight: 20, color: '#C0C4BC', marginTop: 10, maxWidth: 282 }, primaryButton: { position: 'relative', zIndex: 2, alignSelf: 'flex-start', backgroundColor: C.green, borderRadius: 13, flexDirection: 'row', alignItems: 'center', gap: 13, paddingVertical: 11, paddingHorizontal: 15, marginTop: 16, shadowColor: C.green, shadowOpacity: .2, shadowRadius: 7, shadowOffset: { width: 0, height: 4 }, elevation: 3 }, primaryButtonText: { color: C.white, fontSize: 12, fontWeight: '700', letterSpacing: 0.15 }, welcomeDecor: { position: 'absolute', width: 144, height: 144, borderRadius: 76, backgroundColor: 'rgba(194, 157, 103, 0.15)', bottom: -57, right: -23, alignItems: 'center', justifyContent: 'center' }, decorCircle: { width: 104, height: 104, borderRadius: 52, borderWidth: 1, borderColor: 'rgba(144, 111, 66, 0.3)' }, decorQuote: { position: 'absolute', fontFamily: 'Georgia', fontSize: 90, color: 'rgba(144, 111, 66, 0.27)', top: 2, left: 49 },
+  homeStats: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderColor: C.line, paddingBottom: 23, marginBottom: 29 }, statNum: { fontFamily: 'Georgia', color: C.ink, fontSize: 25 }, statLabel: { marginTop: 4, fontSize: 8, letterSpacing: 1, color: C.muted, fontWeight: '700' }, statRule: { width: 1, height: 36, backgroundColor: C.line, marginHorizontal: 24 }, sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 14, marginTop: 4 }, eyebrow: { fontSize: 8, letterSpacing: 1.45, fontWeight: '800', color: C.muted }, sectionTitle: { fontFamily: 'Georgia', fontSize: 23, lineHeight: 28, color: C.ink, marginTop: 5, letterSpacing: -0.35 }, link: { color: C.green, fontSize: 11, fontWeight: '700', marginBottom: 4 }, inspirationIntro: { color: C.muted, fontSize: 11, lineHeight: 16, marginTop: -6, marginBottom: 12 }, communityIntro: { color: C.muted, fontSize: 11, lineHeight: 16, marginTop: -6, marginBottom: 12 }, communityCard: { backgroundColor: C.paper, borderRadius: 14, padding: 12, marginBottom: 8, borderWidth: 1, borderColor: C.line, shadowColor: '#000000', shadowOpacity: .12, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, communityTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, communityIcon: { width: 38, height: 38, borderRadius: 13, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)' }, communityTag: { color: C.muted, fontSize: 8, letterSpacing: 1, fontWeight: '800' }, communityName: { color: C.ink, fontFamily: 'Georgia', fontSize: 18, lineHeight: 23, marginTop: 9 }, communityDetail: { color: C.muted, fontSize: 11, lineHeight: 17, marginTop: 6 }, communityAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: C.line, paddingTop: 9, marginTop: 10 }, communityActionText: { color: C.green, fontSize: 10, fontWeight: '700' }, inspirationViewport: { overflow: 'hidden', marginBottom: 27 }, inspirationTrack: { flexDirection: 'row', alignItems: 'stretch' }, inspirationCard: { width: 188, minHeight: 260, marginRight: 10, borderRadius: 15, padding: 13, position: 'relative', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .1, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 3 }, inspirationIcon: { width: 39, height: 39, borderRadius: 13, backgroundColor: 'rgba(255,255,255,0.06)', alignItems: 'center', justifyContent: 'center', marginBottom: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,.12)', shadowColor: '#51432F', shadowOpacity: .13, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, mediaPreview: { width: '100%', height: 82, borderRadius: 8, marginBottom: 12, backgroundColor: 'rgba(255,255,255,.06)' }, bookCover: { width: 64, height: 88, borderRadius: 4, marginBottom: 12, backgroundColor: 'rgba(255,255,255,.06)', shadowColor: '#51432F', shadowOpacity: .18, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 3 }, inspirationType: { color: '#B7B5A9', fontSize: 8, fontWeight: '800', letterSpacing: 1 }, inspirationTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 18, marginTop: 5 }, inspirationDetail: { color: '#B9BDB5', fontSize: 11, lineHeight: 16, marginTop: 7, paddingRight: 8, flex: 1 }, inspirationAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: 'rgba(49,92,75,.18)', paddingTop: 10, marginTop: 13 }, inspirationActionText: { color: C.green, fontSize: 10, fontWeight: '700' }, genreRow: { flexDirection: 'row', gap: 11, marginBottom: 26 }, genreMini: { backgroundColor: C.paper, flex: 1, borderRadius: 14, padding: 12, minHeight: 138, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .08, shadowRadius: 9, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, genreIcon: { width: 38, height: 38, borderRadius: 13, justifyContent: 'center', alignItems: 'center', marginBottom: 9, borderWidth: 1, borderColor: 'rgba(255,255,255,.1)', shadowColor: '#51432F', shadowOpacity: .14, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, genreTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 16 }, genreDescription: { color: C.muted, fontSize: 10, lineHeight: 14, marginTop: 5 }, savedTeaser: { backgroundColor: C.paper, padding: 13, borderRadius: 13, flexDirection: 'row', gap: 11, alignItems: 'center', marginBottom: 23, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .08, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, savedIcon: { width: 41, height: 41, borderRadius: 15, backgroundColor: C.greenSoft, justifyContent: 'center', alignItems: 'center', shadowColor: C.green, shadowOpacity: .14, shadowRadius: 5, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, bottomQuote: { borderTopWidth: 1, borderColor: C.line, paddingTop: 19, marginTop: 6 }, quoteMark: { color: C.rust, fontFamily: 'Georgia', fontSize: 45, height: 34 }, quoteText: { fontFamily: 'Georgia', fontStyle: 'italic', fontSize: 19, lineHeight: 27, color: C.ink }, quoteBy: { marginTop: 10, fontSize: 8, letterSpacing: 1.5, color: C.muted, fontWeight: '800' },
   directoryGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 10, marginTop: 2, marginBottom: 18 }, directoryCard: { width: '31.5%', aspectRatio: 1, backgroundColor: C.paper, borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 9, alignItems: 'center', justifyContent: 'center', shadowColor: '#0B100E', shadowOpacity: 0.2, shadowRadius: 9, shadowOffset: { width: 0, height: 4 }, elevation: 3 }, directoryCardMain: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center', paddingTop: 8 }, directoryLogo: { width: 38, height: 38, borderRadius: 13, marginBottom: 6, borderWidth: 0 }, directoryBookmark: { position: 'absolute', zIndex: 2, top: 7, right: 7, width: 26, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.06)' }, directoryName: { color: C.ink, fontFamily: 'Georgia', fontSize: 11, lineHeight: 13, textAlign: 'center', fontWeight: '600', width: '100%', minHeight: 26 }, directoryArea: { color: C.muted, fontSize: 8, textAlign: 'center', marginTop: 2, width: '100%' },
   pageIntro: { paddingTop: 20, paddingBottom: 23 }, pageTitle: { fontFamily: 'Georgia', fontSize: 37, lineHeight: 40, letterSpacing: -1.25, color: C.ink, marginTop: 15 }, pageDesc: { color: '#B9BDB5', fontSize: 13, lineHeight: 20, marginTop: 10 }, searchBox: { backgroundColor: C.paper, borderRadius: 13, paddingHorizontal: 13, height: 50, flexDirection: 'row', alignItems: 'center', gap: 9, borderWidth: 1, borderColor: C.line, marginBottom: 12 }, searchInput: { flex: 1, height: '100%', paddingVertical: 0, fontSize: 13, lineHeight: 19, color: C.ink, textAlignVertical: 'center', includeFontPadding: false }, savedFilter: { alignSelf: 'flex-start', borderRadius: 18, backgroundColor: '#2C3C34', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', paddingVertical: 8, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 23 }, savedFilterActive: { backgroundColor: C.green }, savedFilterText: { fontSize: 10, color: C.green, fontWeight: '700' }, savedCount: { fontSize: 9, color: C.muted, fontWeight: '700' }, filterRow: { gap: 7, paddingBottom: 15 }, filterPill: { paddingVertical: 8, paddingHorizontal: 11, borderRadius: 20, backgroundColor: '#303733' }, filterPillActive: { backgroundColor: C.green }, filterText: { color: '#C5C9C1', fontSize: 10, fontWeight: '600' }, filterTextActive: { color: C.white }, genreCard: { backgroundColor: C.paper, padding: 13, borderRadius: 13, marginBottom: 9, flexDirection: 'row', alignItems: 'center', gap: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .07, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, genreType: { fontSize: 8, letterSpacing: 1.1, color: C.muted, fontWeight: '800', marginBottom: 3 }, sectionNote: { fontSize: 11, color: C.muted, marginTop: -5, marginBottom: 13, lineHeight: 16 }, linkCard: { backgroundColor: C.paper, padding: 9, borderRadius: 13, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 2, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)', shadowColor: '#645943', shadowOpacity: .07, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, linkCardMain: { flex: 1, minHeight: 43, flexDirection: 'row', alignItems: 'center', gap: 10, paddingLeft: 3 }, bookmarkButton: { width: 37, height: 40, alignItems: 'center', justifyContent: 'center', borderLeftWidth: 1, borderColor: C.line }, publicationMark: { width: 40, height: 40, borderRadius: 11, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,.1)', shadowColor: '#1F2A25', shadowOpacity: .2, shadowRadius: 5, shadowOffset: { width: 0, height: 3 }, elevation: 2 }, publicationLogo: { width: 30, height: 30, borderRadius: 5 }, publicationMarkText: { color: C.white, fontFamily: 'Georgia', fontWeight: '700', fontSize: 12 }, linkName: { fontFamily: 'Georgia', fontSize: 16, color: C.ink }, cardSub: { fontSize: 10, color: C.muted, marginTop: 4, lineHeight: 14 },
   recordCard: { backgroundColor: '#2B302D', padding: 16, borderRadius: 5, marginBottom: 13 }, recordTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, recordHeadline: { fontFamily: 'Georgia', fontSize: 20, color: C.ink, marginTop: 5 }, soundIcon: { width: 39, height: 39, borderRadius: 21, backgroundColor: '#343B37', alignItems: 'center', justifyContent: 'center' }, waveBox: { height: 47, marginVertical: 13, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 2 }, waveBar: { width: 3, borderRadius: 2 }, recordHint: { fontSize: 10, color: C.muted }, recordButton: { backgroundColor: C.rust, alignSelf: 'center', borderRadius: 30, flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 19, paddingVertical: 11, marginTop: 12 }, recordButtonActive: { backgroundColor: '#7F332A' }, recordButtonText: { color: C.white, fontSize: 11, fontWeight: '700' }, aiNote: { fontSize: 9, color: '#A7AEA7', textAlign: 'center', marginTop: 10 }, editorCard: { backgroundColor: C.paper, borderRadius: 5, padding: 15, borderWidth: 1, borderColor: C.line, marginBottom: 16 }, editorHeader: { flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 12 }, editorBadge: { width: 24, height: 24, borderRadius: 13, backgroundColor: C.greenSoft, justifyContent: 'center', alignItems: 'center' }, editorLabel: { color: C.muted, fontSize: 8, letterSpacing: 1.15, fontWeight: '800', flex: 1 }, wordCount: { color: C.muted, fontSize: 9 }, titleInput: { fontFamily: 'Georgia', fontSize: 18, color: C.ink, borderBottomWidth: 1, borderColor: C.line, paddingVertical: 10 }, bodyInput: { minHeight: 122, fontFamily: 'Georgia', fontSize: 14, lineHeight: 22, color: C.ink, paddingTop: 13 }, editorActions: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', borderTopWidth: 1, borderColor: C.line, paddingTop: 12 }, secondaryButton: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 9, paddingHorizontal: 11, borderWidth: 1, borderColor: '#52665B', borderRadius: 4 }, secondaryButtonText: { color: C.green, fontSize: 10, fontWeight: '700' }, saveButton: { paddingVertical: 10, paddingHorizontal: 16, backgroundColor: C.green, borderRadius: 4 }, saveButtonText: { fontSize: 10, color: C.white, fontWeight: '700' }, questionsCard: { backgroundColor: '#293832', borderRadius: 5, padding: 15, marginBottom: 22 }, questionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }, questionTitle: { fontFamily: 'Georgia', fontSize: 21, marginTop: 4, color: C.ink }, questionRow: { flexDirection: 'row', alignItems: 'center', gap: 9, paddingVertical: 11, borderTopWidth: 1, borderColor: 'rgba(49,92,75,.12)' }, questionNumber: { width: 25, height: 25, borderRadius: 13, backgroundColor: '#3A5144', alignItems: 'center', justifyContent: 'center' }, questionNumberText: { color: C.green, fontSize: 8, fontWeight: '800' }, questionText: { flex: 1, fontSize: 11, lineHeight: 16, color: '#C5C9C1' }, emptyCard: { backgroundColor: C.paper, borderRadius: 4, padding: 19, alignItems: 'center', marginBottom: 20 }, emptyTitle: { fontFamily: 'Georgia', fontSize: 18, color: C.ink, marginTop: 9 }, emptyBody: { textAlign: 'center', maxWidth: 235, color: C.muted, fontSize: 11, lineHeight: 16, marginTop: 5 }, draftItem: { backgroundColor: C.paper, borderRadius: 4, padding: 13, flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  coachFeatured: { backgroundColor: '#2B302D', padding: 17, borderRadius: 4, marginBottom: 27 }, coachFeaturedIcon: { width: 40, height: 40, borderRadius: 22, backgroundColor: '#343B37', alignItems: 'center', justifyContent: 'center', marginBottom: 15 }, coachFeaturedTag: { fontSize: 8, color: C.rust, fontWeight: '800', letterSpacing: 1.3 }, coachFeaturedTitle: { fontFamily: 'Georgia', fontSize: 22, lineHeight: 27, color: C.ink, marginTop: 5 }, coachFeaturedBody: { color: '#B9BDB5', fontSize: 11, lineHeight: 17, marginTop: 8 }, mentorCard: { backgroundColor: C.paper, padding: 15, borderRadius: 4, marginBottom: 10, borderWidth: 1, borderColor: C.line }, mentorTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, mentorIcon: { width: 39, height: 39, borderRadius: 21, backgroundColor: C.greenSoft, alignItems: 'center', justifyContent: 'center' }, mentorName: { fontFamily: 'Georgia', fontSize: 19, color: C.ink, marginTop: 12 }, mentorRole: { fontSize: 11, color: C.green, fontWeight: '700', marginTop: 3 }, mentorDetail: { color: C.muted, fontSize: 11, lineHeight: 17, marginTop: 6 }, mentorLink: { borderTopWidth: 1, borderColor: C.line, marginTop: 12, paddingTop: 11, flexDirection: 'row', alignItems: 'center', gap: 5 }, mentorLinkText: { fontSize: 10, color: C.green, fontWeight: '700' }, coachDisclaimer: { flexDirection: 'row', gap: 9, backgroundColor: '#2A302D', padding: 12, marginTop: 8, marginBottom: 12, borderRadius: 4 }, disclaimerText: { flex: 1, color: C.muted, fontSize: 10, lineHeight: 15 },
-  coachResourceIntro: { marginTop: 17 }, coachResourceHint: { color: C.muted, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 20 }, coachResourceGroup: { marginBottom: 20 }, coachGroupHeading: { flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 10 }, coachGroupIcon: { width: 31, height: 31, borderRadius: 17, backgroundColor: C.greenSoft, alignItems: 'center', justifyContent: 'center' }, coachGroupEyebrow: { color: C.muted, fontSize: 7, letterSpacing: 1.1, fontWeight: '800' }, coachGroupTitle: { fontFamily: 'Georgia', color: C.ink, fontSize: 17, marginTop: 2 }, coachResourceRow: { gap: 9, paddingRight: 22, paddingBottom: 3 }, coachResourceCard: { width: 218, minHeight: 150, padding: 12, backgroundColor: C.paper, borderWidth: 1, borderColor: C.line, borderRadius: 7, justifyContent: 'space-between' }, coachResourceCardPressed: { backgroundColor: '#2A342F', borderColor: C.green, transform: [{ scale: 0.985 }] }, coachResourceCardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, coachResourceName: { fontFamily: 'Georgia', color: C.ink, fontSize: 16, lineHeight: 20, marginTop: 11 }, coachResourceDetail: { color: C.muted, fontSize: 10, lineHeight: 14, marginTop: 5, flex: 1 }, coachResourceAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: C.line, paddingTop: 8, marginTop: 10 }, coachResourceActionText: { color: C.green, fontSize: 9, fontWeight: '700' },
+  historyCard: { backgroundColor: C.paper, borderWidth: 1, borderColor: C.line, borderRadius: 5, padding: 14, marginBottom: 10 },
+  historyTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  historyPlay: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingVertical: 6 },
+  historyPrompt: { color: C.gold, fontSize: 11, lineHeight: 16, marginTop: 8 },
+  historyLabel: { color: C.green, fontSize: 9, fontWeight: '800', letterSpacing: 1, marginTop: 12 },
+  historyBody: { color: C.ink, fontSize: 12, lineHeight: 19, marginTop: 5 },
+  historyLink: { color: C.green, fontSize: 11, fontWeight: '700', marginTop: 12 },
+  coachFeatured: { backgroundColor: '#2B302D', padding: 14, borderRadius: 4, marginBottom: 23 }, coachFeaturedIcon: { width: 36, height: 36, borderRadius: 19, backgroundColor: '#343B37', alignItems: 'center', justifyContent: 'center', marginBottom: 11 }, coachFeaturedTag: { fontSize: 8, color: C.rust, fontWeight: '800', letterSpacing: 1.3 }, coachFeaturedTitle: { fontFamily: 'Georgia', fontSize: 21, lineHeight: 26, color: C.ink, marginTop: 5 }, coachFeaturedBody: { color: '#B9BDB5', fontSize: 11, lineHeight: 17, marginTop: 8 }, mentorCard: { backgroundColor: C.paper, padding: 12, borderRadius: 4, marginBottom: 8, borderWidth: 1, borderColor: C.line }, mentorTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, mentorIcon: { width: 35, height: 35, borderRadius: 18, backgroundColor: C.greenSoft, alignItems: 'center', justifyContent: 'center' }, mentorName: { fontFamily: 'Georgia', fontSize: 18, color: C.ink, marginTop: 9 }, mentorRole: { fontSize: 11, color: C.green, fontWeight: '700', marginTop: 3 }, mentorDetail: { color: C.muted, fontSize: 11, lineHeight: 17, marginTop: 6 }, mentorLink: { borderTopWidth: 1, borderColor: C.line, marginTop: 9, paddingTop: 9, flexDirection: 'row', alignItems: 'center', gap: 5 }, mentorLinkText: { fontSize: 10, color: C.green, fontWeight: '700' }, coachDisclaimer: { flexDirection: 'row', gap: 9, backgroundColor: '#2A302D', padding: 12, marginTop: 8, marginBottom: 12, borderRadius: 4 }, disclaimerText: { flex: 1, color: C.muted, fontSize: 10, lineHeight: 15 },
+  coachResourceIntro: { marginTop: 17 }, coachResourceHint: { color: C.muted, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 20 }, coachResourceGroup: { marginBottom: 20 }, coachGroupHeading: { flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 10 }, coachGroupIcon: { width: 31, height: 31, borderRadius: 17, backgroundColor: C.greenSoft, alignItems: 'center', justifyContent: 'center' }, coachGroupEyebrow: { color: C.muted, fontSize: 7, letterSpacing: 1.1, fontWeight: '800' }, coachGroupTitle: { fontFamily: 'Georgia', color: C.ink, fontSize: 17, marginTop: 2 }, coachResourceRow: { gap: 9, paddingRight: 22, paddingBottom: 3 }, coachResourceCard: { width: 200, minHeight: 138, padding: 10, backgroundColor: C.paper, borderWidth: 1, borderColor: C.line, borderRadius: 7, justifyContent: 'space-between' }, coachResourceCardPressed: { backgroundColor: '#2A342F', borderColor: C.green, transform: [{ scale: 0.985 }] }, coachResourceCardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, coachResourceName: { fontFamily: 'Georgia', color: C.ink, fontSize: 15, lineHeight: 19, marginTop: 8 }, coachResourceDetail: { color: C.muted, fontSize: 10, lineHeight: 14, marginTop: 5, flex: 1 }, coachResourceAction: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderTopWidth: 1, borderColor: C.line, paddingTop: 7, marginTop: 8 }, coachResourceActionText: { color: C.green, fontSize: 9, fontWeight: '700' },
   pitchSteps: { backgroundColor: C.paper, borderRadius: 4, padding: 15, marginBottom: 27, borderWidth: 1, borderColor: C.line }, stepRow: { flexDirection: 'row', gap: 12, borderTopWidth: 1, borderColor: C.line, paddingVertical: 12, marginTop: 2 }, stepNumber: { fontFamily: 'Georgia', color: C.rust, fontSize: 13, marginTop: 1 }, stepTitle: { color: C.ink, fontSize: 12, fontWeight: '700' }, stepDesc: { color: C.muted, fontSize: 10, lineHeight: 15, marginTop: 3 }, pitchTip: { flexDirection: 'row', gap: 10, backgroundColor: '#393528', padding: 13, marginTop: 12, marginBottom: 16, borderRadius: 4 }, tipIcon: { width: 31, height: 31, borderRadius: 17, backgroundColor: '#413A2B', alignItems: 'center', justifyContent: 'center' }, tipTitle: { color: '#5A4A2E', fontFamily: 'Georgia', fontSize: 16 }, tipBody: { color: '#776A53', fontSize: 10, lineHeight: 16, marginTop: 5 },
   profileHero: { alignItems: 'center', paddingTop: 24, paddingBottom: 23, position: 'relative' }, glassBackButton: { position: 'absolute', top: 0, left: 0, zIndex: 2, overflow: 'hidden', width: 43, height: 43, borderRadius: 23, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)', shadowColor: '#51665B', shadowOpacity: 0.18, shadowRadius: 11, shadowOffset: { width: 0, height: 4 }, elevation: 5 }, glassButtonShine: { position: 'absolute', top: 1, left: 8, right: 8, height: 1, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.16)' }, profileAvatarLarge: { width: 78, height: 78, borderRadius: 40, backgroundColor: C.green, justifyContent: 'center', alignItems: 'center' }, profileInitial: { color: C.white, fontFamily: 'Georgia', fontSize: 35 }, profileTitle: { fontFamily: 'Georgia', color: C.ink, fontSize: 25, marginTop: 12 }, profileSubtitle: { color: C.muted, fontSize: 8, letterSpacing: 1.5, marginTop: 4, fontWeight: '700' }, profileCard: { backgroundColor: C.paper, padding: 16, borderRadius: 14, borderWidth: 1, borderColor: C.line, shadowColor: '#645943', shadowOpacity: .07, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 2 }, formLabel: { color: C.muted, fontSize: 10, fontWeight: '700', marginTop: 16, marginBottom: 6 }, profileInput: { borderWidth: 1, borderColor: C.line, backgroundColor: '#1D2422', height: 42, borderRadius: 9, paddingHorizontal: 11, color: C.ink, fontSize: 12 }, profileNote: { color: C.muted, fontSize: 10, lineHeight: 15, marginTop: 12 }, settingsGroup: { marginTop: 26 }, settingsRow: { flexDirection: 'row', gap: 11, alignItems: 'center', paddingVertical: 14, borderBottomWidth: 1, borderColor: C.line }, settingsText: { flex: 1, fontSize: 12, color: C.ink, fontWeight: '600' }, settingsValue: { color: C.muted, fontSize: 10 }, dangerSettingsRow: { borderBottomColor: '#5A3932' }, dangerSettingsText: { color: C.rust }, profileFooter: { alignItems: 'center', marginTop: 28, marginBottom: 8 }, profileFooterBrand: { color: C.ink, fontFamily: 'Georgia', fontWeight: '700', fontSize: 25, letterSpacing: -1 }, profileFooterVersion: { color: C.muted, fontSize: 10, marginTop: 4 }, version: { textAlign: 'center', color: '#858D86', fontSize: 8, letterSpacing: 1.2, marginTop: 11, marginBottom: 14 },
   storyIllo: { position: 'absolute', right: 16, top: 86, width: 126, height: 130, alignItems: 'center', justifyContent: 'center', zIndex: 1 }, illoHalo: { position: 'absolute', width: 112, height: 112, borderRadius: 60, backgroundColor: 'rgba(255,255,255,.04)', borderWidth: 1, borderColor: 'rgba(255,255,255,.08)' }, illoPage: { position: 'absolute', width: 77, height: 91, borderRadius: 5, backgroundColor: '#343B37', padding: 9, top: 18, right: 20, transform: [{ rotate: '7deg' }], shadowColor: '#4B3A20', shadowOpacity: 0.19, shadowRadius: 9, shadowOffset: { width: 0, height: 7 }, elevation: 6, borderWidth: 1, borderColor: '#45514A' }, illoPageMid: { top: 23, right: 27, backgroundColor: '#39433E', transform: [{ rotate: '-9deg' }], elevation: 4 }, illoPageBack: { top: 29, right: 32, backgroundColor: '#536B59', transform: [{ rotate: '-17deg' }], elevation: 3 }, illoPageTop: { flexDirection: 'row', gap: 6, alignItems: 'center' }, illoStamp: { height: 24, width: 24, borderRadius: 7, backgroundColor: C.rust, alignItems: 'center', justifyContent: 'center', transform: [{ rotate: '-8deg' }], shadowColor: C.rust, shadowOpacity: .3, shadowRadius: 3, shadowOffset: { width: 0, height: 2 } }, illoLine: { height: 3, borderRadius: 2, backgroundColor: '#69766C' }, illoQuote: { fontFamily: 'Georgia', color: C.green, fontSize: 32, height: 32, marginTop: 4, marginLeft: -37 }, illoOrb: { width: 34, height: 34, borderRadius: 18, position: 'absolute', right: 0, top: 25, backgroundColor: '#4A4331', justifyContent: 'center', alignItems: 'center', shadowColor: '#745522', shadowOpacity: .24, shadowRadius: 6, shadowOffset: { width: 0, height: 4 }, elevation: 4, borderWidth: 1, borderColor: 'rgba(255,255,255,.1)' }, illoLeaf: { width: 34, height: 34, borderRadius: 18, position: 'absolute', left: 0, bottom: 12, backgroundColor: '#34483B', justifyContent: 'center', alignItems: 'center', shadowColor: '#91B69F', shadowOpacity: .22, shadowRadius: 6, shadowOffset: { width: 0, height: 4 }, elevation: 4, borderWidth: 1, borderColor: 'rgba(255,255,255,.08)' },
+  voiceStoryHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 12 },
+  voiceStoryHeading: { color: C.ink, fontFamily: 'Georgia', fontSize: 23, marginTop: 4 },
+  newVoiceStoryButton: { backgroundColor: C.green, borderRadius: 19, paddingHorizontal: 11, height: 36, flexDirection: 'row', alignItems: 'center', gap: 4 },
+  newVoiceStoryButtonText: { color: C.bg, fontWeight: '800', fontSize: 11 },
+  voiceStoryPicker: { marginBottom: 16, marginHorizontal: -22 },
+  voiceStoryPickerContent: { gap: 8, paddingHorizontal: 22 },
+  voiceStoryChip: { borderColor: C.line, borderWidth: 1, backgroundColor: C.paper, borderRadius: 18, paddingHorizontal: 13, height: 35, justifyContent: 'center', maxWidth: 190 },
+  voiceStoryChipSelected: { backgroundColor: C.greenSoft, borderColor: C.green },
+  voiceStoryChipText: { color: C.muted, fontSize: 11, fontWeight: '700' },
+  voiceStoryChipTextSelected: { color: C.ink, fontSize: 11, fontWeight: '800' },
+  voiceStoryTitleCard: { backgroundColor: C.paper, borderWidth: 1, borderColor: C.line, borderRadius: 11, paddingHorizontal: 14, paddingTop: 11, paddingBottom: 5, marginBottom: 14 },
+  voiceStoryTitleInput: { color: C.ink, fontFamily: 'Georgia', fontSize: 16, minHeight: 37, paddingVertical: 5 },
+  topicIdeasButton: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: C.paper, borderWidth: 1, borderColor: C.line, borderRadius: 12, padding: 15, marginTop: 7, marginBottom: 25 },
+  topicIdeasIcon: { width: 37, height: 37, borderRadius: 19, backgroundColor: '#393528', alignItems: 'center', justifyContent: 'center' },
+  topicIdeasTitle: { color: C.ink, fontFamily: 'Georgia', fontSize: 18, marginTop: 3 },
+  topicIdeasHint: { color: C.muted, fontSize: 10, marginTop: 3 },
+  topicIdeasModal: { flex: 1, backgroundColor: C.bg },
+  topicIdeasToolbar: { height: 57, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderColor: C.line, paddingHorizontal: 17 },
+  topicIdeasBack: { width: 39, height: 39, alignItems: 'center', justifyContent: 'center' },
+  topicIdeasToolbarTitle: { color: C.ink, fontSize: 15, fontWeight: '800' },
+  topicIdeasScroll: { paddingHorizontal: 22, paddingTop: 23, paddingBottom: 35 },
   tabBarFrame: { position: 'absolute', bottom: 9, left: 13, right: 13, height: 72, borderRadius: 27, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)', backgroundColor: 'rgba(40,48,45,0.96)', shadowColor: '#283C36', shadowOpacity: 0.2, shadowRadius: 20, shadowOffset: { width: 0, height: 8 }, elevation: 12 }, tabBar: { height: '100%', backgroundColor: 'rgba(34,41,39,0.94)', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', paddingHorizontal: 5, paddingBottom: 2 }, tabGlassHighlight: { position: 'absolute', top: 0, left: 24, right: 24, height: 1, backgroundColor: 'rgba(255,255,255,0.14)' }, tabItem: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 2 }, tabIconWrap: { width: 43, height: 30, borderRadius: 16, alignItems: 'center', justifyContent: 'center' }, tabIconWrapActive: { backgroundColor: 'rgba(74,105,87,0.82)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)', shadowColor: '#F5F3EC', shadowOpacity: 0.85, shadowRadius: 7, shadowOffset: { width: 0, height: 1 }, elevation: 2 }, tabLabel: { color: '#A7AEA7', fontSize: 11, fontWeight: '700' }, tabLabelActive: { color: '#A8CBB4', fontWeight: '800' },
 });

@@ -1,0 +1,9 @@
+{
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "storage": [{
+    "bucket": "publi-fa006.firebasestorage.app",
+    "rules": "storage.rules"
+  }]
+}

@@ -12,16 +12,26 @@ workflows:
       vars:
         XCODE_WORKSPACE: ios/publi.xcworkspace
         XCODE_SCHEME: publi
+        APP_STORE_APPLE_ID: "6817211884"
       node: 20
     scripts:
       - name: Install JavaScript dependencies
         script: npm ci
-      - name: Generate iOS project
-        script: npx expo prebuild --platform ios --clean --no-install
+      - name: Verify AI service behavior
+        script: npm test
+      - name: Verify native live voice module
+        script: |
+          test -f ios/publi/LivePCMPlayer.m
+          grep -q 'LivePCMPlayer.m in Sources' ios/publi.xcodeproj/project.pbxproj
       - name: Install CocoaPods dependencies
         script: pod install --project-directory=ios
       - name: Apply App Store signing profile
         script: xcode-project use-profiles
+      - name: Set next TestFlight build number
+        script: |
+          LATEST_BUILD_NUMBER=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID")
+          cd ios
+          agvtool new-version -all "$((LATEST_BUILD_NUMBER + 1))"
       - name: Build signed IPA
         script: xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME" --config Release
     artifacts:
@@ -30,5 +40,6 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
-        submit_to_testflight: true
-        beta_groups: []
+        submit_to_testflight: false
+        beta_groups:
+          - Publi Internal Testers

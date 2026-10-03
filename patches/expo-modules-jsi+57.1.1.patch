@@ -1,0 +1,114 @@
+diff --git a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h
+index 6115e87..529159e 100644
+--- a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h
++++ b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h
+@@ -5,6 +5,12 @@
+ #include <atomic>
+ #include <swift/bridging>
+ 
++#if defined(__apple_build_version__) && __apple_build_version__ >= 18000000
++#define EXPO_RUNTIME_SCHEDULER_CTOR_RETAINED SWIFT_RETURNS_RETAINED
++#else
++#define EXPO_RUNTIME_SCHEDULER_CTOR_RETAINED
++#endif
++
+ namespace expo {
+ 
+ /**
+@@ -50,7 +56,7 @@ public:
+    `scheduleTask` dispatches through `fn`, which the host implements against
+    the real react::RuntimeScheduler.
+    */
+-  SWIFT_RETURNS_RETAINED RuntimeScheduler(void *scheduler, ScheduleFn fn) noexcept
++  EXPO_RUNTIME_SCHEDULER_CTOR_RETAINED RuntimeScheduler(void *scheduler, ScheduleFn fn) noexcept
+       : nativeScheduler(scheduler), scheduleFn(fn) {}
+ 
+   /**
+@@ -58,7 +64,7 @@ public:
+    caller's thread — intended for standalone runtimes (e.g. tests) that have
+    no React scheduler.
+    */
+-  SWIFT_RETURNS_RETAINED RuntimeScheduler() {}
++  EXPO_RUNTIME_SCHEDULER_CTOR_RETAINED RuntimeScheduler() {}
+ 
+   RuntimeScheduler(const RuntimeScheduler &) = delete;
+ 
+@@ -89,6 +95,8 @@ public:
+   }
+ } SWIFT_SHARED_REFERENCE(retainRuntimeScheduler, releaseRuntimeScheduler);
+ 
++#undef EXPO_RUNTIME_SCHEDULER_CTOR_RETAINED
++
+ } // namespace expo
+ 
+ /** Retains the RuntimeScheduler, called by Swift's ARC. */
+diff --git a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift
+index 3d796ee..215fe8c 100644
+--- a/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift
++++ b/node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift
+@@ -185,12 +185,12 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
+       resultPtr: UnsafeMutablePointer<facebook.jsi.Value>
+     ) -> Bool {
+       let propertyName = String(cString: propertyName)
+-      nonisolated(unsafe) let resultPtr = resultPtr
++      let resultPtr = NonisolatedUnsafeVar(resultPtr)
+ 
+       return withGuaranteedContext(context) { (context: HostObjectContext, runtime) in
+         return JavaScriptActor.assumeIsolated {
+           return forwardingSwiftErrorsToJS(runtime: runtime) {
+-            try context.get(propertyName).writeJSIValue(to: resultPtr)
++            try context.get(propertyName).writeJSIValue(to: resultPtr.value)
+           }
+         }
+       }
+@@ -774,19 +774,19 @@ private func createFunctionClosure(
+     // synchronous call, so the `nonisolated(unsafe)` capture is sound. This removes a per-call class
+     // allocation + retain/release + dealloc that profiling showed dominating the no-op `@JS` host-call
+     // floor.
+-    nonisolated(unsafe) let thisPtr = thisPtr
+-    nonisolated(unsafe) let argumentsPtr = argumentsPtr
+-    nonisolated(unsafe) let resultPtr = resultPtr
++    let thisPtr = NonisolatedUnsafeVar(thisPtr)
++    let argumentsPtr = NonisolatedUnsafeVar(argumentsPtr)
++    let resultPtr = NonisolatedUnsafeVar(resultPtr)
+ 
+     // See `withGuaranteedContext` for why neither the context nor the runtime is retained here, and
+     // why the result is written to the caller's slot instead of being returned.
+     return withGuaranteedContext(context) { (context: HostFunctionContext, runtime) in
+       return JavaScriptActor.assumeIsolated {
+         return forwardingSwiftErrorsToJS(runtime: runtime) {
+-          let this = UnsafeMutablePointer(mutating: thisPtr).move()
+-          let arguments = JavaScriptValuesBuffer(runtime, start: argumentsPtr, count: argumentsCount)
++          let this = UnsafeMutablePointer(mutating: thisPtr.value).move()
++          let arguments = JavaScriptValuesBuffer(runtime, start: argumentsPtr.value, count: argumentsCount)
+           let thisValue = JavaScriptValue(runtime, this)
+-          try context.call(thisValue, consume arguments).writeJSIValue(to: resultPtr)
++          try context.call(thisValue, consume arguments).writeJSIValue(to: resultPtr.value)
+         }
+       }
+     }
+@@ -817,18 +817,18 @@ private func createFunctionClosure(
+     // handed in as a borrowed `JavaScriptUnownedValue` pointing straight at the C++-owned `this` slot:
+     // it is not moved out and no owning `JavaScriptValue` is allocated, so the closure avoids the
+     // per-call `weak`-runtime form/destroy and heap object that the owning `this` pays.
+-    nonisolated(unsafe) let thisPtr = thisPtr
+-    nonisolated(unsafe) let argumentsPtr = argumentsPtr
+-    nonisolated(unsafe) let resultPtr = resultPtr
++    let thisPtr = NonisolatedUnsafeVar(thisPtr)
++    let argumentsPtr = NonisolatedUnsafeVar(argumentsPtr)
++    let resultPtr = NonisolatedUnsafeVar(resultPtr)
+ 
+     // See `withGuaranteedContext` for why neither the context nor the runtime is retained here, and
+     // why the result is written to the caller's slot instead of being returned.
+     return withGuaranteedContext(context) { (context: UnownedThisHostFunctionContext, runtime) in
+       return JavaScriptActor.assumeIsolated {
+         return forwardingSwiftErrorsToJS(runtime: runtime) {
+-          let arguments = JavaScriptValuesBuffer(runtime, start: argumentsPtr, count: argumentsCount)
+-          let thisValue = JavaScriptUnownedValue(runtime.pointee, thisPtr)
+-          try context.call(thisValue, consume arguments).writeJSIValue(to: resultPtr)
++          let arguments = JavaScriptValuesBuffer(runtime, start: argumentsPtr.value, count: argumentsCount)
++          let thisValue = JavaScriptUnownedValue(runtime.pointee, thisPtr.value)
++          try context.call(thisValue, consume arguments).writeJSIValue(to: resultPtr.value)
+         }
+       }
+     }

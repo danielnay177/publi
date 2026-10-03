@@ -1,0 +1,214 @@
+// Prototype rules for the Standard (default) Cloud Firestore database.
+// Assumed model:
+// users/{uid}: name (string), email (string), bookmarks (list), updatedAt (timestamp)
+// users/{uid}/drafts/{id}: title/body (strings), createdAtMs/updatedAtMs
+//   (numbers), createdAt/updatedAt (timestamps)
+// users/{uid}/voiceStories/{id}: title, titleSource, openingText,
+//   createdAtMs/updatedAtMs, createdAt/updatedAt. Groups ordered recordings.
+// users/{uid}/recordings/{id}: draftId (string or null), prompt, durationMillis,
+//   storagePath, contentType, status, recordingTitle (optional on legacy notes),
+//   transcript, polishedText, questions,
+//   error, createdAtMs, createdAt, updatedAt; newer records additionally have
+//   storyId, parentRecordingId, attemptIndex. Legacy records omit these.
+// All documents are private to the authenticated owner. Unknown fields deny.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function owner(uid) { return signedIn() && request.auth.uid == uid; }
+    function validUser() {
+      let d = request.resource.data;
+      return d.keys().hasAll(['updatedAt'])
+        && d.keys().hasOnly(['name', 'email', 'bookmarks', 'updatedAt'])
+        && (!('name' in d) || (d.name is string && d.name.size() <= 120))
+        && (!('email' in d) || (d.email is string && d.email.size() <= 320))
+        && (!('bookmarks' in d) || (d.bookmarks is list && d.bookmarks.size() <= 500))
+        && d.updatedAt is timestamp && d.updatedAt == request.time;
+    }
+    function validDraft() {
+      let d = request.resource.data;
+      return d.keys().hasAll(['title', 'body', 'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && d.keys().hasOnly(['title', 'body', 'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && d.title is string && d.title.size() <= 200
+        && d.body is string && d.body.size() > 0 && d.body.size() <= 100000
+        && d.createdAtMs is number && d.createdAtMs > 0
+        && d.updatedAtMs is number && d.updatedAtMs >= d.createdAtMs
+        && d.createdAt is timestamp && d.updatedAt is timestamp
+        && d.updatedAt == request.time;
+    }
+    function validQuestions(q) {
+      return q is list && (
+        q.size() == 0 || (q.size() == 3
+          && q[0] is string && q[0].size() <= 500
+          && q[1] is string && q[1].size() <= 500
+          && q[2] is string && q[2].size() <= 500));
+    }
+    function validVoiceStory() {
+      let d = request.resource.data;
+      return d.keys().hasAll(['title', 'titleSource', 'openingText',
+          'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && d.keys().hasOnly(['title', 'titleSource', 'openingText', 'archived',
+          'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && (!('archived' in d) || d.archived is bool)
+        && d.title is string && d.title.size() <= 200
+        && d.titleSource in ['user', 'ai', 'untitled']
+        && (d.titleSource != 'untitled' || d.title == '')
+        && d.openingText is string && d.openingText.size() <= 100000
+        && d.createdAtMs is number && d.createdAtMs > 0
+        && d.updatedAtMs is number && d.updatedAtMs >= d.createdAtMs
+        && d.createdAt is timestamp && d.updatedAt is timestamp
+        && d.updatedAt == request.time;
+    }
+    function validRecordingChain(uid, d) {
+      let storyId = d.get('storyId', null);
+      let parentId = d.get('parentRecordingId', null);
+      return storyId == null
+        ? parentId == null
+        : (parentId == null
+          ? d.attemptIndex == 1
+          : (exists(/databases/$(database)/documents/users/$(uid)/recordings/$(parentId))
+            && get(/databases/$(database)/documents/users/$(uid)/recordings/$(parentId)).data.get('storyId', null) == storyId
+            && get(/databases/$(database)/documents/users/$(uid)/recordings/$(parentId)).data.get('attemptIndex', 0) + 1 == d.attemptIndex));
+    }
+    function validRecording(uid, id) {
+      let d = request.resource.data;
+      return d.keys().hasAll(['draftId', 'prompt', 'durationMillis', 'storagePath',
+          'contentType', 'status', 'transcript', 'polishedText', 'questions',
+          'error', 'createdAtMs', 'createdAt', 'updatedAt'])
+        && d.keys().hasOnly(['draftId', 'storyId', 'parentRecordingId', 'attemptIndex',
+          'prompt', 'durationMillis', 'storagePath',
+          'contentType', 'status', 'recordingTitle', 'transcript', 'polishedText', 'questions',
+          'error', 'createdAtMs', 'createdAt', 'updatedAt'])
+        && (d.draftId == null || (d.draftId is string && d.draftId.size() <= 128))
+        && (!('storyId' in d) || d.storyId == null ||
+          (d.storyId is string && d.storyId.size() > 0 && d.storyId.size() <= 128))
+        && (d.get('storyId', null) == null ||
+          exists(/databases/$(database)/documents/users/$(uid)/voiceStories/$(d.storyId)))
+        && (!('parentRecordingId' in d) || d.parentRecordingId == null ||
+          (d.parentRecordingId is string && d.parentRecordingId.size() > 0 && d.parentRecordingId.size() <= 128))
+        && (!('attemptIndex' in d) ||
+          (d.attemptIndex is int && d.attemptIndex >= 1 && d.attemptIndex <= 10000))
+        && d.prompt is string && d.prompt.size() <= 1000
+        && d.durationMillis is number && d.durationMillis >= 0 && d.durationMillis <= 7200000
+        && d.storagePath is string
+        && d.storagePath.matches('^users/' + uid + '/recordings/' + id + '\\.(m4a|mp3|wav|caf|3gp)$')
+        && d.contentType in ['audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-caf', 'audio/3gpp']
+        && d.status in ['processing', 'ready', 'error']
+        && (!('recordingTitle' in d) || (d.recordingTitle is string && d.recordingTitle.size() <= 200))
+        && d.transcript is string && d.transcript.size() <= 100000
+        && d.polishedText is string && d.polishedText.size() <= 100000
+        && validQuestions(d.questions)
+        && d.error is string && d.error.size() <= 1000
+        && d.createdAtMs is number && d.createdAtMs > 0
+        && d.createdAt is timestamp && d.updatedAt is timestamp
+        && d.updatedAt == request.time;
+    }
+    function validAskThread() {
+      let d = request.resource.data;
+      return d.keys().hasAll(['title', 'lastMessagePreview', 'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && d.keys().hasOnly(['title', 'lastMessagePreview', 'createdAtMs', 'updatedAtMs', 'createdAt', 'updatedAt'])
+        && d.title is string && d.title.size() > 0 && d.title.size() <= 90
+        && d.lastMessagePreview is string && d.lastMessagePreview.size() <= 300
+        && d.createdAtMs is number && d.createdAtMs > 0
+        && d.updatedAtMs is number && d.updatedAtMs >= d.createdAtMs
+        && d.createdAt is timestamp && d.updatedAt is timestamp
+        && d.updatedAt == request.time;
+    }
+    function validAskTurn(uid, threadId, turnId) {
+      let d = request.resource.data;
+      return d.keys().hasAll(['prompt', 'imagePath', 'imageContentType', 'audioPath', 'audioContentType', 'answer', 'status', 'error',
+          'createdAtMs', 'createdAt', 'updatedAt'])
+        && d.keys().hasOnly(['prompt', 'imagePath', 'imageContentType', 'audioPath', 'audioContentType', 'answer', 'status', 'error',
+          'createdAtMs', 'createdAt', 'updatedAt'])
+        && d.prompt is string && d.prompt.size() > 0 && d.prompt.size() <= 4000
+        && d.imagePath is string
+        && (d.imagePath == '' || d.imagePath.matches('^users/' + uid + '/askImages/' + threadId + '/' + turnId + '\\.(jpg|png|webp)$'))
+        && d.imageContentType in ['', 'image/jpeg', 'image/png', 'image/webp']
+        && ((d.imagePath == '' && d.imageContentType == '') ||
+            (d.imagePath != '' && d.imageContentType != ''))
+        && d.audioPath is string
+        && (d.audioPath == '' || d.audioPath == 'users/' + uid + '/askAudio/' + threadId + '/' + turnId + '.m4a')
+        && d.audioContentType in ['', 'audio/mp4']
+        && ((d.audioPath == '' && d.audioContentType == '') ||
+            (d.audioPath != '' && d.audioContentType == 'audio/mp4'))
+        && d.answer is string && d.answer.size() <= 20000
+        && d.status in ['processing', 'ready', 'error']
+        && d.error is string && d.error.size() <= 1000
+        && d.createdAtMs is number && d.createdAtMs > 0
+        && d.createdAt is timestamp && d.updatedAt is timestamp
+        && d.updatedAt == request.time;
+    }
+
+    match /users/{uid} {
+      allow get, list: if owner(uid);
+      allow create: if owner(uid) && validUser();
+      allow update: if owner(uid) && validUser();
+      allow delete: if owner(uid);
+
+      match /drafts/{id} {
+        allow get, list: if owner(uid);
+        allow create: if owner(uid) && validDraft() && request.resource.data.createdAt == request.time;
+        allow update: if owner(uid) && validDraft()
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.createdAtMs == resource.data.createdAtMs;
+        allow delete: if owner(uid);
+      }
+      match /voiceStories/{id} {
+        allow get, list: if owner(uid);
+        allow create: if owner(uid) && validVoiceStory()
+          && request.resource.data.createdAt == request.time;
+        allow update: if owner(uid) && validVoiceStory()
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.createdAtMs == resource.data.createdAtMs;
+        allow delete: if owner(uid);
+      }
+      match /recordings/{id} {
+        allow get, list: if owner(uid);
+        allow create: if owner(uid) && validRecording(uid, id)
+          && validRecordingChain(uid, request.resource.data)
+          && request.resource.data.createdAt == request.time;
+        allow update: if owner(uid) && validRecording(uid, id)
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.createdAtMs == resource.data.createdAtMs
+          && request.resource.data.storagePath == resource.data.storagePath
+          && request.resource.data.contentType == resource.data.contentType
+          && (
+            // One-time attachment of a legacy recording to a story.
+            (resource.data.get('storyId', null) == null
+              && request.resource.data.get('storyId', null) is string
+              && request.resource.data.parentRecordingId == null
+              && request.resource.data.attemptIndex == 1)
+            || (request.resource.data.get('storyId', null) == resource.data.get('storyId', null)
+              && request.resource.data.get('parentRecordingId', null) == resource.data.get('parentRecordingId', null)
+              && request.resource.data.get('attemptIndex', null) == resource.data.get('attemptIndex', null)));
+        allow delete: if owner(uid);
+      }
+      match /askThreads/{threadId} {
+        allow get, list: if owner(uid);
+        allow create: if owner(uid) && validAskThread()
+          && request.resource.data.createdAt == request.time;
+        allow update: if owner(uid) && validAskThread()
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.createdAtMs == resource.data.createdAtMs;
+        allow delete: if owner(uid);
+        match /turns/{turnId} {
+          allow get, list: if owner(uid);
+          allow create: if owner(uid) && validAskTurn(uid, threadId, turnId)
+            && request.resource.data.status == 'processing'
+            && request.resource.data.answer == ''
+            && request.resource.data.createdAt == request.time;
+          allow update: if owner(uid) && validAskTurn(uid, threadId, turnId)
+            && request.resource.data.createdAt == resource.data.createdAt
+            && request.resource.data.createdAtMs == resource.data.createdAtMs
+            && (request.resource.data.prompt == resource.data.prompt ||
+                (resource.data.prompt == 'Voice message' && resource.data.audioPath != ''))
+            && request.resource.data.imagePath == resource.data.imagePath
+            && request.resource.data.imageContentType == resource.data.imageContentType
+            && request.resource.data.audioPath == resource.data.audioPath
+            && request.resource.data.audioContentType == resource.data.audioContentType;
+          allow delete: if owner(uid);
+        }
+      }
+    }
+  }
+}

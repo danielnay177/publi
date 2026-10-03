@@ -7,9 +7,14 @@
     "userInterfaceStyle": "light",
     "icon": "./assets/publi-icon.png",
     "newArchEnabled": true,
-    "ios": { "supportsTablet": true, "bundleIdentifier": "com.publi.app", "buildNumber": "1" },
-    "android": { "package": "com.publi.app", "adaptiveIcon": { "foregroundImage": "./assets/publi-icon.png", "backgroundColor": "#171C1B" } },
-    "plugins": [["expo-audio", { "microphonePermission": "Publi uses your microphone to record your story ideas." }]],
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.publi.app", "buildNumber": "1", "googleServicesFile": "./GoogleService-Info.plist", "infoPlist": { "NSCameraUsageDescription": "Publi lets you take a photo to discuss with Publi.", "NSPhotoLibraryUsageDescription": "Publi lets you choose a photo to discuss with Publi." }, "entitlements": { "com.apple.developer.devicecheck.appattest-environment": "production" } },
+    "android": { "package": "com.publi.app", "googleServicesFile": "./google-services.json", "adaptiveIcon": { "foregroundImage": "./assets/publi-icon.png", "backgroundColor": "#171C1B" } },
+    "plugins": [
+      ["expo-audio", { "microphonePermission": "Publi uses your microphone to record your story ideas." }],
+      ["@react-native-firebase/app", { "ios": { "disableSPM": true } }],
+      "@react-native-firebase/app-check",
+      ["expo-build-properties", { "ios": { "useFrameworks": "static" } }]
+    ],
     "splash": { "backgroundColor": "#171C1B", "resizeMode": "contain" }
   }
 }

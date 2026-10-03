@@ -1,0 +1,35 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/recordings/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null && request.auth.uid == uid
+        && fileName.matches('^[A-Za-z0-9_-]+\\.(m4a|mp3|wav|caf|3gp)$')
+        && request.resource.size > 0 && request.resource.size <= 30 * 1024 * 1024
+        && request.resource.contentType in [
+          'audio/mp4', 'audio/x-m4a', 'audio/m4a', 'audio/mpeg',
+          'audio/wav', 'audio/x-caf', 'audio/3gpp'];
+      allow update: if false;
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+    match /users/{uid}/askImages/{threadId}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null && request.auth.uid == uid
+        && threadId.matches('^[A-Za-z0-9_-]+$')
+        && fileName.matches('^[A-Za-z0-9_-]+\\.(jpg|png|webp)$')
+        && request.resource.size > 0 && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType in ['image/jpeg', 'image/png', 'image/webp'];
+      allow update: if false;
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+    match /users/{uid}/askAudio/{threadId}/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null && request.auth.uid == uid
+        && threadId.matches('^[A-Za-z0-9_-]+$')
+        && fileName.matches('^[A-Za-z0-9_-]+\\.m4a$')
+        && request.resource.size > 0 && request.resource.size <= 14 * 1024 * 1024;
+      allow update: if false;
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}

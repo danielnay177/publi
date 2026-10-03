@@ -4,17 +4,29 @@
   "private": true,
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
+    "test": "node --test verification/ai-service.test.cjs",
+    "postinstall": "patch-package",
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios"
+    "android": "expo run:android",
+    "ios": "expo run:ios"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.0",
+    "@firebase/util": "^1.15.3",
     "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-firebase/ai": "^26.4.0",
+    "@react-native-firebase/app": "^26.4.0",
+    "@react-native-firebase/app-check": "^26.4.0",
+    "@react-native-firebase/auth": "^26.4.0",
+    "@react-native-firebase/firestore": "^26.4.0",
+    "@react-native-firebase/storage": "^26.4.0",
+    "base64-js": "^1.5.1",
     "expo": "~57.0.17",
     "expo-audio": "~57.0.5",
     "expo-blur": "~57.0.3",
-    "firebase": "^12.19.0",
+    "expo-build-properties": "~57.0.7",
+    "expo-file-system": "~57.0.7",
+    "expo-speech": "~57.0.3",
     "react": "19.2.3",
     "react-native": "0.86.3",
     "react-native-safe-area-context": "~5.7.0",
@@ -22,6 +34,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.2.0",
+    "patch-package": "^8.0.1",
     "typescript": "~6.0.3"
   }
 }

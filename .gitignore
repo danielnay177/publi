@@ -2,7 +2,10 @@ node_modules/
 .expo/
 dist/
 web-build/
-ios/
+# Keep the customized iOS project, including LivePCMPlayer, in source control.
+ios/Pods/
+ios/build/
+ios/.xcode.env.local
 android/
 *.log
 .DS_Store
@@ -12,3 +15,5 @@ android/
 *.key
 *.mobileprovision
 *.orig.*
+verification/ios-export/
+verification/TESTFLIGHT_READINESS.md
